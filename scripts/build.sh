@@ -10,9 +10,15 @@
 set -eu
 
 if ! command -v lazysql >/dev/null 2>&1; then
+  # `${PATH-...}` without the colon so a set-but-empty PATH is not reported as unset —
+  # a sanitised launch environment usually exports an empty PATH rather than dropping it.
+  path_searched="${PATH-(unset)}"
+  if [ -z "$path_searched" ]; then
+    path_searched="(empty)"
+  fi
   echo "herdr-db: lazysql was not found on PATH.
 
-PATH searched: ${PATH:-(unset)}
+PATH searched: $path_searched
 
 herdr-db opens lazysql as the database browser; it does not install it for you.
 If it is installed somewhere not listed above, add that directory to PATH. Otherwise
@@ -50,49 +56,49 @@ plugin again:
 fi
 
 # The manifest hardcodes the Pane command as ./target/release/herdr-db, so the build output
-# has to land exactly there. Cargo offers two ways for the environment to move it, and both
-# are neutralised here rather than left to whatever the user's machine is configured for:
+# has to end up exactly there. Rather than predict where cargo will write — CARGO_TARGET_DIR
+# moves the directory, CARGO_BUILD_TARGET or a config file's `[build] target` inserts a
+# triple — the build is asked to report the artifact it produced, and that exact file is
+# installed. Asking removes every way a previous run's leftovers could be mistaken for this
+# one's output, and means nothing has to be deleted up front: a failed build leaves the
+# currently installed binary untouched rather than destroying it.
 #
-#   CARGO_TARGET_DIR / [build] target-dir  moves the directory  -> pinned with --target-dir
-#   CARGO_BUILD_TARGET / [build] target    inserts a triple     -> unset below
-#
-# Cross-compiling is never right for this binary in any case: it runs on the machine that
-# installed it. Without the unset, a routine cross-compilation setup builds successfully to
-# target/<triple>/release and the install fails with a diagnostic it cannot act on.
-unset CARGO_BUILD_TARGET
-
-# Removed before the build, not merely overwritten by it: with a triple configured, cargo
-# writes to target/<triple>/release and never touches this path, so an earlier install's
-# binary would otherwise survive and the Pane would go on running it while this install
-# reported success. After this, anything at this path came from this run.
+# `json-render-diagnostics` keeps compiler errors human-readable on stderr while the machine
+# format goes to stdout. The path is reported even when the build is a no-op.
 binary="target/release/herdr-db"
-rm -f "$binary"
 
-cargo build --release --target-dir target
+built="$(
+  cargo build --release --target-dir target --message-format=json-render-diagnostics \
+    | sed -n 's/.*"executable":"\([^"]*\)".*/\1/p' \
+    | tail -1
+)"
 
-# A config file can set `[build] target`, which the unset above cannot reach. When that
-# triple is the host's, the binary is native and merely misplaced — move it into place
-# rather than refusing an install that is perfectly good. Only a genuine cross-compile,
-# whose binary would not run here, falls through to the failure below.
-if [ ! -x "$binary" ]; then
-  host="$(rustc -vV 2>/dev/null | sed -n 's/^host: //p')"
-  if [ -n "$host" ] && [ -x "target/$host/release/herdr-db" ]; then
-    mkdir -p target/release
-    cp "target/$host/release/herdr-db" "$binary"
-  fi
+if [ -z "$built" ] || [ ! -x "$built" ]; then
+  echo "herdr-db: the build reported no executable. The Pane cannot start without one." >&2
+  echo "Please report this with the output above." >&2
+  exit 1
 fi
 
-if [ ! -x "$binary" ]; then
-  echo "herdr-db: the build finished but produced no binary at $binary." >&2
-  echo "" >&2
-  if [ -n "$(ls -d target/*/release 2>/dev/null || true)" ]; then
-    echo "It was built for a specific target triple instead:" >&2
-    ls -d target/*/release >&2
+# A triple in the path means cargo was configured to build for a specific target. That is
+# fine when it is this machine's — a common config for stable artifact paths — and the
+# binary is simply somewhere the manifest does not name. It is not fine when it is another
+# machine's, because that binary cannot run here.
+host="$(rustc -vV 2>/dev/null | sed -n 's/^host: //p')"
+case "$built" in
+  */target/release/herdr-db) ;;
+  */target/"$host"/release/herdr-db) ;;
+  *)
+    echo "herdr-db: the build produced a binary for another machine:" >&2
+    echo "" >&2
+    echo "    $built" >&2
     echo "" >&2
     echo "This plugin must build for the machine it runs on. Remove the \`[build] target\`" >&2
     echo "setting from your cargo config, or install this plugin with it overridden." >&2
-  else
-    echo "The Pane cannot start without it. Please report this with the output above." >&2
-  fi
-  exit 1
+    exit 1
+    ;;
+esac
+
+if [ "$built" != "$PWD/$binary" ]; then
+  mkdir -p target/release
+  cp "$built" "$binary"
 fi

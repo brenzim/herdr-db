@@ -232,6 +232,17 @@ fn configure_cargo_target(tree: &Path, triple: &str) {
     .expect("write the cargo config");
 }
 
+/// A real target triple that is definitely not this machine's, whichever machine that is.
+/// Naming one outright would make the test pass vacuously on a host that happens to be it.
+fn a_triple_that_is_not_this_machines() -> &'static str {
+    let candidates = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"];
+    let host = host_triple();
+    candidates
+        .into_iter()
+        .find(|triple| *triple != host)
+        .expect("one of the candidates differs from the host")
+}
+
 fn path_with_a_stub_client(label: &str) -> String {
     format!(
         "{}:{}",
@@ -292,6 +303,7 @@ fn installs_when_the_environment_has_no_home() {
         .current_dir(&tree)
         .env("PATH", path_with_a_stub_client("no-home-path"))
         .env_remove("HOME")
+        .env_remove("CARGO_HOME")
         .output()
         .expect("run the build step");
     assert!(
@@ -309,7 +321,7 @@ fn refuses_to_install_a_build_for_a_foreign_target_triple() {
     // installed the refusal comes from cargo rather than from the guard below it — either
     // way, a foreign binary must never be installed.)
     let tree = fresh_copy_of_the_source_tree("foreign-tree");
-    configure_cargo_target(&tree, "x86_64-unknown-linux-gnu");
+    configure_cargo_target(&tree, a_triple_that_is_not_this_machines());
 
     let out = Command::new("/bin/sh")
         .arg("scripts/build.sh")
@@ -325,5 +337,43 @@ fn refuses_to_install_a_build_for_a_foreign_target_triple() {
     assert!(
         !tree.join(pane_binary_path()).is_file(),
         "a binary that cannot run on this machine reached the manifest's path",
+    );
+}
+
+#[test]
+fn installs_this_builds_artifact_and_not_a_leftover_from_an_earlier_one() {
+    // The build step installs the file cargo reports having produced. A binary sitting in a
+    // target-triple directory from some earlier configuration is not that file, and must not
+    // be mistaken for it — the failure it guards against is an install that exits 0 while the
+    // Pane runs something nobody built this time.
+    let tree = fresh_copy_of_the_source_tree("leftover-tree");
+
+    let leftover = tree
+        .join("target")
+        .join(host_triple())
+        .join("release")
+        .join("herdr-db");
+    fs::create_dir_all(leftover.parent().expect("the leftover has a parent"))
+        .expect("create the triple directory");
+    fs::write(&leftover, "#!/bin/sh\necho LEFTOVER\n").expect("plant a leftover binary");
+    fs::set_permissions(&leftover, fs::Permissions::from_mode(0o755))
+        .expect("make the leftover executable");
+
+    let out = Command::new("/bin/sh")
+        .arg("scripts/build.sh")
+        .current_dir(&tree)
+        .env("PATH", path_with_a_stub_client("leftover-path"))
+        .output()
+        .expect("run the build step");
+    assert!(
+        out.status.success(),
+        "the build step must succeed, but it said:\n{}",
+        everything_said(&out),
+    );
+
+    assert_ne!(
+        fs::read(tree.join(pane_binary_path())).expect("read the installed binary"),
+        fs::read(&leftover).expect("read the leftover binary"),
+        "a leftover from an earlier build was installed as though this build produced it",
     );
 }
