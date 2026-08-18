@@ -3,7 +3,7 @@
 //! at the moment the user first presses the key.
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -32,6 +32,17 @@ fn host_triple() -> String {
         .find_map(|line| line.strip_prefix("host: "))
         .expect("rustc reports a host triple")
         .to_string()
+}
+
+/// Where rustc actually lives, for the run that hides it from PATH but still needs the
+/// build itself to compile.
+fn real_rustc() -> String {
+    let out = Command::new("/bin/sh")
+        .arg("-c")
+        .arg("command -v rustc")
+        .output()
+        .expect("ask the shell where rustc is");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
 fn plugin_root() -> PathBuf {
@@ -341,39 +352,201 @@ fn refuses_to_install_a_build_for_a_foreign_target_triple() {
 }
 
 #[test]
-fn installs_this_builds_artifact_and_not_a_leftover_from_an_earlier_one() {
-    // The build step installs the file cargo reports having produced. A binary sitting in a
-    // target-triple directory from some earlier configuration is not that file, and must not
-    // be mistaken for it — the failure it guards against is an install that exits 0 while the
-    // Pane runs something nobody built this time.
-    let tree = fresh_copy_of_the_source_tree("leftover-tree");
-
-    let leftover = tree
-        .join("target")
-        .join(host_triple())
-        .join("release")
-        .join("herdr-db");
-    fs::create_dir_all(leftover.parent().expect("the leftover has a parent"))
-        .expect("create the triple directory");
-    fs::write(&leftover, "#!/bin/sh\necho LEFTOVER\n").expect("plant a leftover binary");
-    fs::set_permissions(&leftover, fs::Permissions::from_mode(0o755))
-        .expect("make the leftover executable");
+fn installs_when_the_plugin_root_is_reached_through_a_symlink() {
+    // macOS reaches /tmp through a symlink to /private/tmp, and plugin directories get
+    // symlinked into place by hand too — so the shell's working directory and the physical
+    // path cargo reports name the same file with two different strings. Deciding whether the
+    // built binary is already the installed one by comparing those strings copies the file
+    // onto itself, which fails, and takes an otherwise perfect install down with it.
+    let tree = fresh_copy_of_the_source_tree("symlink-tree");
+    let link = scratch("symlink-root").join("plugin");
+    symlink(&tree, &link).expect("symlink the plugin root");
 
     let out = Command::new("/bin/sh")
         .arg("scripts/build.sh")
-        .current_dir(&tree)
-        .env("PATH", path_with_a_stub_client("leftover-path"))
+        .current_dir(&link)
+        // A shell keeps an inherited PWD that names its working directory, symlink and all.
+        // That is what the build step sees when herdr was launched through one.
+        .env("PWD", &link)
+        .env("PATH", path_with_a_stub_client("symlink-path"))
         .output()
         .expect("run the build step");
     assert!(
         out.status.success(),
-        "the build step must succeed, but it said:\n{}",
+        "a plugin root reached through a symlink must still install, but it said:\n{}",
         everything_said(&out),
     );
 
-    assert_ne!(
-        fs::read(tree.join(pane_binary_path())).expect("read the installed binary"),
-        fs::read(&leftover).expect("read the leftover binary"),
-        "a leftover from an earlier build was installed as though this build produced it",
+    assert!(
+        link.join(pane_binary_path()).is_file(),
+        "the Pane binary is missing from the path the manifest names",
+    );
+}
+
+#[test]
+fn reports_a_compile_error_as_a_compile_error_and_not_as_a_bug_to_report() {
+    // /bin/sh has no `pipefail`, so cargo run in a pipeline hides its exit status: a build
+    // that did not compile looks exactly like one that reported no artifact, and the user is
+    // told to report their own compile error as a bug in this plugin.
+    let tree = fresh_copy_of_the_source_tree("compile-error-tree");
+    let source = tree.join("src").join("lib.rs");
+    let mut broken = fs::read_to_string(&source).expect("read the source");
+    broken.push_str("\npub fn deliberately_broken() -> u32 {\n    \"not a number\"\n}\n");
+    fs::write(&source, broken).expect("break the source");
+
+    let out = Command::new("/bin/sh")
+        .arg("scripts/build.sh")
+        .current_dir(&tree)
+        .env("PATH", path_with_a_stub_client("compile-error-path"))
+        .output()
+        .expect("run the build step");
+    let said = everything_said(&out);
+
+    assert!(
+        !out.status.success(),
+        "source that does not compile must fail the install, but it said:\n{said}",
+    );
+    assert!(
+        said.contains("mismatched types"),
+        "the failure must be the compiler's own report of the error, which is the only thing \
+         that tells the user what to fix. It said:\n{said}",
+    );
+    assert!(
+        !said.contains("Please report this"),
+        "the user is being asked to file a bug against this plugin for their own compile \
+         error. It said:\n{said}",
+    );
+}
+
+#[test]
+fn builds_for_this_machine_even_when_the_environment_names_another_target() {
+    // A CARGO_BUILD_TARGET inherited from the environment herdr was launched in would
+    // cross-compile: at best a binary the Pane cannot run, and on a machine without that
+    // target installed no binary at all. Noticing afterwards where the artifact landed only
+    // reports the damage; clearing the variable is what keeps a native build native.
+    let tree = fresh_copy_of_the_source_tree("env-triple-tree");
+    let path = path_with_a_stub_client("env-triple-path");
+
+    let out = Command::new("/bin/sh")
+        .arg("scripts/build.sh")
+        .current_dir(&tree)
+        .env("PATH", &path)
+        .env("CARGO_BUILD_TARGET", a_triple_that_is_not_this_machines())
+        .output()
+        .expect("run the build step");
+    assert!(
+        out.status.success(),
+        "a foreign triple in the environment must not fail the install, but it said:\n{}",
+        everything_said(&out),
+    );
+
+    // That the binary is this machine's is proved by this machine running it: it execs the
+    // Client, which the stub on PATH answers for.
+    let ran = Command::new(tree.join(pane_binary_path()))
+        .env("PATH", &path)
+        .status()
+        .expect("run the installed Pane binary");
+    assert!(
+        ran.success(),
+        "the installed Pane binary does not run on this machine: {ran}",
+    );
+}
+
+#[test]
+fn installs_a_native_build_when_rustc_cannot_say_which_machine_this_is() {
+    // A rustup shim with no default toolchain answers `rustc -vV` with an error, so there is
+    // no host triple to compare the artifact's path against. That comparison is the only
+    // thing that recognises a native `target/<triple>/release` build as native, and a build
+    // that cannot be checked must not be condemned: this one runs here.
+    let tree = fresh_copy_of_the_source_tree("no-rustc-tree");
+    configure_cargo_target(&tree, &host_triple());
+
+    let shims = directory_containing_a_stub_client("no-rustc-path");
+    let failing_rustc = shims.join("rustc");
+    fs::write(
+        &failing_rustc,
+        "#!/bin/sh\necho 'error: no default toolchain configured' >&2\nexit 1\n",
+    )
+    .expect("write the failing rustc");
+    fs::set_permissions(&failing_rustc, fs::Permissions::from_mode(0o755))
+        .expect("make the failing rustc executable");
+    let path = format!(
+        "{}:{}",
+        shims.display(),
+        std::env::var("PATH").unwrap_or_default(),
+    );
+
+    let out = Command::new("/bin/sh")
+        .arg("scripts/build.sh")
+        .current_dir(&tree)
+        .env("PATH", &path)
+        // cargo is told where rustc really is, so the build itself still runs while the
+        // build step's own `rustc -vV` finds only the failing shim ahead of it on PATH.
+        .env("RUSTC", real_rustc())
+        .output()
+        .expect("run the build step");
+    let said = everything_said(&out);
+
+    assert!(
+        out.status.success(),
+        "a native build must install even when rustc cannot be asked to confirm it is \
+         native, but the build step said:\n{said}",
+    );
+    assert!(
+        said.contains("did not report a host triple"),
+        "the run did not reach the unknown-host case at all, so it proves nothing about it \
+         — the shim must be the rustc the build step finds. It said:\n{said}",
+    );
+    assert!(
+        tree.join(pane_binary_path()).is_file(),
+        "the Pane binary is missing from the path the manifest names",
+    );
+}
+
+#[test]
+fn installs_the_pane_binary_even_when_the_build_produces_other_executables() {
+    // Taking the last executable cargo reports is only right while this crate has exactly
+    // one. A second [[bin]] — or an example, or a build script — reports one too, and which
+    // is reported last is a question about compilation order. Installing that one hands the
+    // Pane a program that is not the Pane.
+    let tree = fresh_copy_of_the_source_tree("two-bins-tree");
+    let manifest = tree.join("Cargo.toml");
+    let mut declared = fs::read_to_string(&manifest).expect("read the manifest");
+    declared.push_str("\n[[bin]]\nname = \"other-tool\"\npath = \"src/other_tool.rs\"\n");
+    fs::write(&manifest, declared).expect("declare a second binary");
+
+    // The second binary is padded until it takes longer to compile than the Pane binary, so
+    // that cargo reports it last on every run. Which artifact comes last is otherwise cargo's
+    // business, and a test that only sometimes meets the ordering it is about proves nothing.
+    let mut other_tool = String::from("fn main() {\n    std::process::exit(97);\n}\n");
+    for n in 0..4000 {
+        other_tool.push_str(&format!(
+            "#[allow(dead_code)]\nfn f{n}(x: u64) -> u64 {{ x.wrapping_mul({n}).wrapping_add({n}) }}\n"
+        ));
+    }
+    fs::write(tree.join("src").join("other_tool.rs"), other_tool).expect("write the second binary");
+
+    let path = path_with_a_stub_client("two-bins-path");
+    let out = Command::new("/bin/sh")
+        .arg("scripts/build.sh")
+        .current_dir(&tree)
+        .env("PATH", &path)
+        .output()
+        .expect("run the build step");
+    assert!(
+        out.status.success(),
+        "a build with a second binary in it must still install, but it said:\n{}",
+        everything_said(&out),
+    );
+
+    // The Pane binary execs the Client and exits with its status; the other one exits 97.
+    let ran = Command::new(tree.join(pane_binary_path()))
+        .env("PATH", &path)
+        .status()
+        .expect("run the installed Pane binary");
+    assert!(
+        ran.success(),
+        "the manifest's path holds the other binary the build produced, so the Pane would \
+         run that instead of the Client: {ran}",
     );
 }

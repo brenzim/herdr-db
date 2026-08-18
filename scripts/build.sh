@@ -62,13 +62,30 @@ fi
 # installed. Asking removes every way a previous run's leftovers could be mistaken for this
 # one's output, and means nothing has to be deleted up front: a failed build leaves the
 # currently installed binary untouched rather than destroying it.
-#
-# `json-render-diagnostics` keeps compiler errors human-readable on stderr while the machine
-# format goes to stdout. The path is reported even when the build is a no-op.
 binary="target/release/herdr-db"
+artifacts="target/build-artifacts.json"
 
+# Reporting the artifact says where a cross-compiled binary landed; it does not stop one being
+# produced. Clearing the environment's triple is what keeps a native build native, and leaves
+# a config file's `[build] target` — which nothing here can reach — as the only route the
+# check further down has to refuse.
+unset CARGO_BUILD_TARGET
+
+# The machine-readable stream is redirected to a file rather than piped: /bin/sh has no
+# `pipefail`, so cargo inside a pipeline hides its exit status from `set -e`, and a build that
+# did not compile would arrive below as "no executable reported" — asking the user to file a
+# bug against this plugin for their own compile error. `json-render-diagnostics` keeps the
+# compiler's errors human-readable on stderr meanwhile.
+mkdir -p target
+cargo build --release --target-dir target --message-format=json-render-diagnostics >"$artifacts"
+
+# The Pane binary is picked out by name rather than by taking the last executable reported: a
+# build script, an example or a second [[bin]] each report one too, and which of them comes
+# last is a question about compilation order. Installing that one would put a program that is
+# not the Pane at the path the manifest names.
 built="$(
-  cargo build --release --target-dir target --message-format=json-render-diagnostics \
+  grep '"reason":"compiler-artifact"' "$artifacts" \
+    | grep '"name":"herdr-db"' \
     | sed -n 's/.*"executable":"\([^"]*\)".*/\1/p' \
     | tail -1
 )"
@@ -83,22 +100,40 @@ fi
 # fine when it is this machine's — a common config for stable artifact paths — and the
 # binary is simply somewhere the manifest does not name. It is not fine when it is another
 # machine's, because that binary cannot run here.
+#
+# An unanswerable `rustc -vV` — no rustc on PATH, or a rustup shim with no default toolchain —
+# leaves `host` empty, which makes the second pattern unmatchable and sends every triple path
+# to the last branch. That case is handled there rather than being read as a foreign build.
 host="$(rustc -vV 2>/dev/null | sed -n 's/^host: //p')"
 case "$built" in
   */target/release/herdr-db) ;;
   */target/"$host"/release/herdr-db) ;;
   *)
-    echo "herdr-db: the build produced a binary for another machine:" >&2
-    echo "" >&2
-    echo "    $built" >&2
-    echo "" >&2
-    echo "This plugin must build for the machine it runs on. Remove the \`[build] target\`" >&2
-    echo "setting from your cargo config, or install this plugin with it overridden." >&2
-    exit 1
+    if [ -z "$host" ]; then
+      echo "herdr-db: rustc did not report a host triple, so the build could not be checked" >&2
+      echo "for being this machine's. Installing what cargo reported:" >&2
+      echo "" >&2
+      echo "    $built" >&2
+    else
+      echo "herdr-db: the build produced a binary for another machine:" >&2
+      echo "" >&2
+      echo "    $built" >&2
+      echo "" >&2
+      echo "This plugin must build for the machine it runs on. CARGO_BUILD_TARGET is cleared" >&2
+      echo "before the build, so the triple came from a \`[build] target\` setting in a cargo" >&2
+      echo "config file: this tree's .cargo/config.toml, one in a directory above it, or" >&2
+      echo "\$CARGO_HOME/config.toml. Remove it there, or install with it overridden." >&2
+      exit 1
+    fi
     ;;
 esac
 
-if [ "$built" != "$PWD/$binary" ]; then
+# File identity, not string equality: cargo reports a physical path while the shell's working
+# directory may be a logical one (macOS reaches /tmp through a symlink to /private/tmp), so
+# two different strings can name the same file. Comparing them as strings runs `cp` on that
+# file onto itself, which fails and fails the install with it. `-ef` is false when the
+# destination does not exist yet, so a first install still copies.
+if [ ! "$built" -ef "$binary" ]; then
   mkdir -p target/release
   cp "$built" "$binary"
 fi
