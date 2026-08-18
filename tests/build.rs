@@ -158,8 +158,12 @@ fn refuses_to_install_when_the_rust_toolchain_is_missing_and_says_so() {
     // fails with a raw `not found` from the shell rather than a message the user can act
     // on. The Client is present here, so the run gets past that check to this one.
     let stubs = directory_containing_a_stub_client("no-cargo-path");
+    // A HOME with no rustup env file, so the build step's fallback for a GUI-launched
+    // herdr finds nothing either — otherwise this machine's own toolchain answers.
+    let toolchainless_home = scratch("no-cargo-home");
     let out = build_step()
         .env("PATH", stubs)
+        .env("HOME", &toolchainless_home)
         .output()
         .expect("run the build step");
     let said = everything_said(&out);
@@ -173,5 +177,46 @@ fn refuses_to_install_when_the_rust_toolchain_is_missing_and_says_so() {
         "the failure must be the plugin's own message naming how to get a toolchain — a \
          raw `cargo: not found` from the shell mentions cargo too, and is exactly what this \
          check exists to replace. It said:\n{said}",
+    );
+}
+
+#[test]
+fn compiles_to_the_manifests_path_even_when_cargo_is_configured_for_the_host_triple() {
+    // Pinning `[build] target` to the host triple is a routine cargo config — stable
+    // artifact paths, sccache and RUSTFLAGS isolation — and it is not a cross-compile: the
+    // binary it produces is native and runnable. It lands under a triple directory though,
+    // which no environment change can prevent, since a config file is not the environment.
+    let tree = fresh_copy_of_the_source_tree("host-triple-tree");
+    let stubs = directory_containing_a_stub_client("host-triple-path");
+    let path = format!(
+        "{}:{}",
+        stubs.display(),
+        std::env::var("PATH").unwrap_or_default(),
+    );
+
+    fs::create_dir_all(tree.join(".cargo")).expect("create the cargo config directory");
+    fs::write(
+        tree.join(".cargo").join("config.toml"),
+        format!("[build]\ntarget = \"{}\"\n", host_triple()),
+    )
+    .expect("write the cargo config");
+
+    let out = Command::new("/bin/sh")
+        .arg("scripts/build.sh")
+        .current_dir(&tree)
+        .env("PATH", path)
+        .output()
+        .expect("run the build step");
+    assert!(
+        out.status.success(),
+        "a host-triple build is native and must install, but the build step said:\n{}",
+        everything_said(&out),
+    );
+
+    let binary = tree.join(pane_binary_path());
+    assert!(
+        binary.is_file(),
+        "the native binary must end up at the path the manifest names, {}",
+        binary.display(),
     );
 }

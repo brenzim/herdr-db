@@ -10,15 +10,26 @@
 set -eu
 
 if ! command -v lazysql >/dev/null 2>&1; then
-  echo "herdr-db: lazysql is not installed.
+  echo "herdr-db: lazysql was not found on PATH.
+
+PATH searched: $PATH
 
 herdr-db opens lazysql as the database browser; it does not install it for you.
-Install it and then install this plugin again:
+If it is installed somewhere not listed above, add that directory to PATH. Otherwise
+install it and then install this plugin again:
 
     brew install lazysql          # macOS / Linuxbrew
     go install github.com/jorgerojas26/lazysql@latest
 " >&2
   exit 1
+fi
+
+# Source rustup's env if it is there, so cargo is found even when herdr was launched
+# without ~/.cargo/bin on PATH (a GUI or login-less launch). rustup edits shell rc files
+# only, so a perfectly working toolchain is invisible here otherwise. Written as an `if`
+# rather than `[ -f ] && .` so a missing env file cannot trip `set -e`.
+if [ -f "$HOME/.cargo/env" ]; then
+  . "$HOME/.cargo/env"
 fi
 
 if ! command -v cargo >/dev/null 2>&1; then
@@ -45,11 +56,20 @@ fi
 unset CARGO_BUILD_TARGET
 cargo build --release --target-dir target
 
-# Reachable when `[build] target` is set in a cargo config file rather than the environment
-# — the unset above cannot see that, so say what it is instead of failing opaquely. The
-# artifact is deliberately not copied into place: a genuine cross-compile would put a
-# foreign-architecture binary where the Pane expects a runnable one.
 binary="target/release/herdr-db"
+
+# A config file can set `[build] target`, which the unset above cannot reach. When that
+# triple is the host's, the binary is native and merely misplaced — move it into place
+# rather than refusing an install that is perfectly good. Only a genuine cross-compile,
+# whose binary would not run here, falls through to the failure below.
+if [ ! -x "$binary" ]; then
+  host="$(rustc -vV 2>/dev/null | sed -n 's/^host: //p')"
+  if [ -n "$host" ] && [ -x "target/$host/release/herdr-db" ]; then
+    mkdir -p target/release
+    cp "target/$host/release/herdr-db" "$binary"
+  fi
+fi
+
 if [ ! -x "$binary" ]; then
   echo "herdr-db: the build finished but produced no binary at $binary." >&2
   echo "" >&2
