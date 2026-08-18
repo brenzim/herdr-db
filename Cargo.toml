@@ -1,0 +1,18 @@
+[package]
+name = "herdr-db"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+description = "A herdr plugin that opens a PostgreSQL browser in a Pane, connected to the current Project's database"
+license = "MIT"
+
+[lib]
+name = "herdr_db"
+path = "src/lib.rs"
+
+[[bin]]
+name = "herdr-db"
+path = "src/main.rs"
+
+[dev-dependencies]
+toml = "1.1"
