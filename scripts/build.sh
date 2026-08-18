@@ -12,7 +12,7 @@ set -eu
 if ! command -v lazysql >/dev/null 2>&1; then
   echo "herdr-db: lazysql was not found on PATH.
 
-PATH searched: $PATH
+PATH searched: ${PATH:-(unset)}
 
 herdr-db opens lazysql as the database browser; it does not install it for you.
 If it is installed somewhere not listed above, add that directory to PATH. Otherwise
@@ -27,9 +27,15 @@ fi
 # Source rustup's env if it is there, so cargo is found even when herdr was launched
 # without ~/.cargo/bin on PATH (a GUI or login-less launch). rustup edits shell rc files
 # only, so a perfectly working toolchain is invisible here otherwise. Written as an `if`
-# rather than `[ -f ] && .` so a missing env file cannot trip `set -e`.
-if [ -f "$HOME/.cargo/env" ]; then
-  . "$HOME/.cargo/env"
+# rather than `[ -f ] && .` so a missing env file cannot trip `set -e`, and every expansion
+# defaulted, because the same login-less environments may carry no HOME at all.
+cargo_env="${CARGO_HOME:-${HOME:-}/.cargo}/env"
+if [ -f "$cargo_env" ]; then
+  # `set -u` is lifted across the source: rustup's env script is not written to be
+  # nounset-clean (it expands $HOME unguarded), and it is not ours to fix.
+  set +u
+  . "$cargo_env"
+  set -u
 fi
 
 if ! command -v cargo >/dev/null 2>&1; then
@@ -54,9 +60,15 @@ fi
 # installed it. Without the unset, a routine cross-compilation setup builds successfully to
 # target/<triple>/release and the install fails with a diagnostic it cannot act on.
 unset CARGO_BUILD_TARGET
-cargo build --release --target-dir target
 
+# Removed before the build, not merely overwritten by it: with a triple configured, cargo
+# writes to target/<triple>/release and never touches this path, so an earlier install's
+# binary would otherwise survive and the Pane would go on running it while this install
+# reported success. After this, anything at this path came from this run.
 binary="target/release/herdr-db"
+rm -f "$binary"
+
+cargo build --release --target-dir target
 
 # A config file can set `[build] target`, which the unset above cannot reach. When that
 # triple is the host's, the binary is native and merely misplaced — move it into place

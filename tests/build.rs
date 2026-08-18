@@ -4,7 +4,7 @@
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use herdr_db::client;
@@ -218,5 +218,112 @@ fn compiles_to_the_manifests_path_even_when_cargo_is_configured_for_the_host_tri
         binary.is_file(),
         "the native binary must end up at the path the manifest names, {}",
         binary.display(),
+    );
+}
+
+/// Point cargo at `triple` from a config file inside `tree`, which is the one route the
+/// build step cannot neutralise by clearing the environment.
+fn configure_cargo_target(tree: &Path, triple: &str) {
+    fs::create_dir_all(tree.join(".cargo")).expect("create the cargo config directory");
+    fs::write(
+        tree.join(".cargo").join("config.toml"),
+        format!("[build]\ntarget = \"{triple}\"\n"),
+    )
+    .expect("write the cargo config");
+}
+
+fn path_with_a_stub_client(label: &str) -> String {
+    format!(
+        "{}:{}",
+        directory_containing_a_stub_client(label).display(),
+        std::env::var("PATH").unwrap_or_default(),
+    )
+}
+
+#[test]
+fn replaces_a_stale_binary_rather_than_leaving_it_in_place() {
+    // With a triple configured, cargo writes to target/<triple>/release and never touches
+    // the manifest's path — so a binary left there by an earlier install must not be what
+    // the Pane goes on running. An install that exits 0 having changed nothing is worse
+    // than one that fails.
+    let tree = fresh_copy_of_the_source_tree("stale-tree");
+    configure_cargo_target(&tree, &host_triple());
+
+    let binary = tree.join(pane_binary_path());
+    fs::create_dir_all(binary.parent().expect("the binary has a parent"))
+        .expect("create the release directory");
+    fs::write(&binary, "#!/bin/sh\necho STALE\n").expect("plant a stale binary");
+    fs::set_permissions(&binary, fs::Permissions::from_mode(0o755))
+        .expect("make the stale binary executable");
+
+    let out = Command::new("/bin/sh")
+        .arg("scripts/build.sh")
+        .current_dir(&tree)
+        .env("PATH", path_with_a_stub_client("stale-path"))
+        .output()
+        .expect("run the build step");
+    assert!(
+        out.status.success(),
+        "the build step must succeed, but it said:\n{}",
+        everything_said(&out),
+    );
+
+    let built = tree
+        .join("target")
+        .join(host_triple())
+        .join("release")
+        .join("herdr-db");
+    assert_eq!(
+        fs::read(&binary).expect("read the installed binary"),
+        fs::read(&built).expect("read the freshly built binary"),
+        "the manifest's path still holds the stale binary, so the Pane would run it",
+    );
+}
+
+#[test]
+fn installs_when_the_environment_has_no_home() {
+    // launchd and systemd can exec with no HOME at all — the same login-less launches the
+    // rustup fallback exists to serve. Reaching for $HOME unguarded under `set -u` would
+    // abort the install for a user whose toolchain is already on PATH.
+    let tree = fresh_copy_of_the_source_tree("no-home-tree");
+
+    let out = Command::new("/bin/sh")
+        .arg("scripts/build.sh")
+        .current_dir(&tree)
+        .env("PATH", path_with_a_stub_client("no-home-path"))
+        .env_remove("HOME")
+        .output()
+        .expect("run the build step");
+    assert!(
+        out.status.success(),
+        "the build step must survive an environment with no HOME, but it said:\n{}",
+        everything_said(&out),
+    );
+    assert!(tree.join(pane_binary_path()).is_file());
+}
+
+#[test]
+fn refuses_to_install_a_build_for_a_foreign_target_triple() {
+    // The safety property the host-triple recovery leans on: only a binary that runs on
+    // this machine may reach the manifest's path. (On a machine without that target
+    // installed the refusal comes from cargo rather than from the guard below it — either
+    // way, a foreign binary must never be installed.)
+    let tree = fresh_copy_of_the_source_tree("foreign-tree");
+    configure_cargo_target(&tree, "x86_64-unknown-linux-gnu");
+
+    let out = Command::new("/bin/sh")
+        .arg("scripts/build.sh")
+        .current_dir(&tree)
+        .env("PATH", path_with_a_stub_client("foreign-path"))
+        .output()
+        .expect("run the build step");
+    assert!(
+        !out.status.success(),
+        "a foreign-triple build must not install, but the build step said:\n{}",
+        everything_said(&out),
+    );
+    assert!(
+        !tree.join(pane_binary_path()).is_file(),
+        "a binary that cannot run on this machine reached the manifest's path",
     );
 }
