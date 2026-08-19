@@ -172,15 +172,29 @@ fn an_unrecognised_key_leaves_the_pane_alive() {
 #[test]
 fn the_pane_binary_never_terminates_itself_mid_flight() {
     let main = include_str!("../src/main.rs");
-    // Every spelling, not just the qualified one: `use std::process::exit;` and a bare
-    // `exit(1)` is the ordinary way to write this once the path is imported, and `abort()`
-    // ends the process just as dead. A guard that only knows `::exit(` misses both.
-    for call in ["exit(", "abort("] {
+    // Both terminators, and both spellings of each: the qualified call, and the import that
+    // is what makes a bare `exit(1)` writable at all. Matching call shapes rather than a
+    // bare `exit(`/`abort(` substring keeps that coverage without failing the day someone
+    // writes the word in a doc comment or names a helper `wants_exit`.
+    for name in ["exit", "abort"] {
+        let call = format!("process::{name}(");
         assert!(
-            !main.contains(call),
+            !main.contains(&call),
             "`src/main.rs` calls `{call}`, terminating the process directly. On a Decline \
              that closes the Pane on the diagnosis the user is meant to read (AC 7) — \
              return an `ExitCode` from `main` instead.",
+        );
+        // Grouped or single, `use std::process::{{exit}}` is the only way a bare `exit(1)`
+        // compiles, so the import is the shape to catch.
+        let import = main.lines().map(str::trim_start).find(|line| {
+            line.starts_with("use ") && line.contains("process::") && line.contains(name)
+        });
+        assert!(
+            import.is_none(),
+            "`src/main.rs` imports `{name}` from `std::process` ({}), so it can terminate \
+             the process directly. On a Decline that closes the Pane on the diagnosis the \
+             user is meant to read (AC 7) — return an `ExitCode` from `main` instead.",
+            import.unwrap_or_default(),
         );
     }
 }
