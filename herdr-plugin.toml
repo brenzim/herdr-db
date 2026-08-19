@@ -1,0 +1,36 @@
+# herdr-plugin.toml — manifest for the herdr-db plugin.
+#
+# A PostgreSQL browser opened in a herdr split Pane, already connected to the database
+# belonging to the Project that the Worktree herdr was invoked from identifies (ADR-0003).
+
+id = "db"
+name = "herdr-db"
+version = "0.1.0"
+description = "Open a PostgreSQL browser in a Pane, connected to this Project's database."
+min_herdr_version = "0.8.0"
+platforms = ["linux", "macos"]
+
+# Build step herdr runs at install time: compile the Pane binary, and verify the Client is
+# installed. Verifying at install time means a missing Client is discovered now rather than
+# at the moment the user first presses the key. This step does not install the Client.
+[[build]]
+platforms = ["linux", "macos"]
+command = ["/bin/sh", "scripts/build.sh"]
+
+# The Pane that hosts the Client. herdr runs this command in a real PTY with full keyboard
+# input, so the Client *is* the Pane body (ADR-0001) — the binary resolves a DSN and then
+# execs the Client in place, replacing itself.
+[[panes]]
+id = "db"
+title = "Database"
+placement = "split"
+command = ["./target/release/herdr-db"]
+
+# The action that summons the Pane, bound to a keybinding in herdr's config. herdr actions
+# run a command rather than declaring a Pane to open, so this shells out to the launcher.
+[[actions]]
+id = "open-db"
+platforms = ["linux", "macos"]
+title = "Open database"
+description = "Open a PostgreSQL browser connected to this Project's database."
+command = ["bash", "scripts/open-db.sh"]
