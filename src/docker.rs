@@ -18,13 +18,19 @@ pub fn candidates(project: &Path, host: &dyn Host) -> Vec<Candidate> {
     let Some(project_root) = host.canonicalize(project) else {
         return Vec::new();
     };
-    running(project, host)
+    let mut found: Vec<Candidate> = running(project, host)
         .iter()
         .filter_map(|id| host.run("docker", &["inspect", id], project))
         .filter(|inspected| inspected.status == 0)
         .filter_map(|inspected| serde_json::from_str::<serde_json::Value>(&inspected.stdout).ok())
         .filter_map(|inspected| candidate(inspected.get(0)?, &project_root, host))
-        .collect()
+        .collect();
+    // `docker ps` lists in whichever order it lists, and the rank the title states must not
+    // be one of them: only consistent behaviour is learnable, so a Project resolves to the
+    // same Candidate every run. Stated as the two things the order is, rather than derived
+    // from the struct, whose field order is not an opinion about which database to open.
+    found.sort_by_key(|candidate| (candidate.port, candidate.container.clone()));
+    found
 }
 
 /// The ids of every container Docker reports as running. Liveness is asked of Docker and
@@ -60,6 +66,9 @@ const IMAGES: [&str; 4] = ["postgres", "pgvector", "timescale", "supabase"];
 /// owns it is how the wrong database gets edited.
 const COMPOSE_WORKING_DIR: &str = "com.docker.compose.project.working_dir";
 
+/// The role the official image starts as when nothing names one.
+const DEFAULT_ROLE: &str = "postgres";
+
 /// One container's `docker inspect` object as a Candidate, or `None` if it is not one of
 /// `project`'s: the wrong image, the wrong directory, or no reachable port.
 fn candidate(
@@ -67,15 +76,12 @@ fn candidate(
     project_root: &Path,
     host: &dyn Host,
 ) -> Option<Candidate> {
-    let image = inspected.get("Config")?.get("Image")?.as_str()?;
+    let config = inspected.get("Config")?;
+    let image = config.get("Image")?.as_str()?;
     if !IMAGES.iter().any(|known| image.contains(known)) {
         return None;
     }
-    let working_dir = inspected
-        .get("Config")?
-        .get("Labels")?
-        .get(COMPOSE_WORKING_DIR)?
-        .as_str()?;
+    let working_dir = config.get("Labels")?.get(COMPOSE_WORKING_DIR)?.as_str()?;
     // A label naming a directory this machine does not have resolves to nothing, and a
     // container that cannot be placed is not this Project's: falling back to the raw path
     // would match it on its spelling, which is what canonicalising is here to stop.
@@ -86,17 +92,55 @@ fn candidate(
     if !working_dir.starts_with(project_root) {
         return None;
     }
+    // The image's own defaults, because they are what the container that is running did:
+    // an unset `POSTGRES_USER` started it as `postgres`, and an unset `POSTGRES_DB` gave it
+    // a database named after whichever role that resolved to. An unset `POSTGRES_PASSWORD`
+    // stays unset — a guessed password turns a connection that would have worked into one
+    // that is refused.
+    let role = setting(config, "POSTGRES_USER").unwrap_or(DEFAULT_ROLE);
     Some(Candidate {
         origin: Origin::Docker,
-        // Placeholders, for the same reason as `Candidate::dsn`: the container's
-        // environment is read where the DSN is assembled, in the second half of #4.
-        database: String::new(),
-        role: String::new(),
-        password: None,
+        database: setting(config, "POSTGRES_DB").unwrap_or(role).to_string(),
+        role: role.to_string(),
+        password: setting(config, "POSTGRES_PASSWORD").map(str::to_string),
         port: published_port(inspected)?,
-        container: String::new(),
+        container: name(inspected),
         read_only: false,
     })
+}
+
+/// What the container's environment says `name` is, or `None` when it does not say. The
+/// official image reads its own configuration from here, and so does everything built on
+/// it, which is why this is the environment of the container that is running rather than
+/// of the compose file that may or may not have started it.
+///
+/// An empty value has said nothing: Compose writes one out of an unset shell variable, and
+/// the image reads it as absent — the same rule the invocation context's tiers follow.
+///
+/// Split on the *first* `=` and no other: base64 pads with `=`, so a generated password
+/// routinely carries one, and a value cut short is a password that is quietly wrong.
+fn setting<'a>(config: &'a serde_json::Value, name: &str) -> Option<&'a str> {
+    config
+        .get("Env")?
+        .as_array()?
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .filter_map(|entry| entry.split_once('='))
+        .find(|(key, value)| *key == name && !value.is_empty())
+        .map(|(_, value)| value)
+}
+
+/// The container's name as the user reads it in `docker ps`: Docker reports it with a
+/// leading `/`, and the tie-break between two Candidates on one port sorts on it. Empty
+/// only in an answer Docker has never given — a container that names itself nothing ties
+/// on nothing rather than stopping being a Candidate.
+fn name(inspected: &serde_json::Value) -> String {
+    inspected
+        .get("Name")
+        .and_then(serde_json::Value::as_str)
+        .map(|name| name.strip_prefix('/').unwrap_or(name))
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// The host port the container's PostgreSQL is reachable on, or `None` when it is not:

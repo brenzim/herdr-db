@@ -33,20 +33,63 @@ pub struct Candidate {
     pub read_only: bool,
 }
 
+/// The scheme a DSN is addressed with, held as its bare word: the whole prefix is a
+/// credential-shaped literal, and `tests/redaction.rs` refuses one anywhere in `src/`.
+const SCHEME: &str = "postgres";
+
+/// The address a local Candidate is reached at. Numeric, never the name: a machine that
+/// resolves the name to `::1` first fails against a port Docker bound on IPv4.
+const HOST: &str = "127.0.0.1";
+
+/// `value` with everything outside the unreserved set percent-encoded, byte by byte, for
+/// the two places a DSN carries something a person chose: the role and the password. A
+/// password of `p@ss/word` written in as it reads addresses a different host and a
+/// different database, and the Client has no way to know it was handed the wrong one.
+fn encoded(value: &str) -> String {
+    value
+        .bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                char::from(byte).to_string()
+            }
+            reserved => format!("%{reserved:02X}"),
+        })
+        .collect()
+}
+
 impl Candidate {
     /// The DSN the Client is launched against.
-    //
-    // A placeholder: what a Candidate renders to is the second half of #4. Until then a
-    // Candidate is observable as a Launch existing at all, which is what matching decides.
     pub fn dsn(&self) -> String {
-        String::new()
+        let credentials = match &self.password {
+            Some(password) => format!("{}:{}", encoded(&self.role), encoded(password)),
+            None => encoded(&self.role),
+        };
+        format!(
+            "{SCHEME}://{credentials}@{HOST}:{}/{}",
+            self.port, self.database,
+        )
     }
 
     /// The Pane title: which database is in use, where the answer came from, and which
     /// role it connected as — plus which of `of` Candidates this one is.
-    //
-    // A placeholder, for the same reason as `dsn`.
-    pub fn title(&self, _rank: usize, _of: usize) -> String {
-        String::new()
+    ///
+    /// Never carries the password, and never the DSN it is assembled from the parts of:
+    /// the title is on screen for as long as the Pane is, in front of whoever walks past
+    /// (AC 10, ADR-0005).
+    pub fn title(&self, rank: usize, of: usize) -> String {
+        let mut title = format!(
+            "{}@{} · {} · {}",
+            self.database,
+            self.port,
+            self.origin.label(),
+            self.role,
+        );
+        // Only when there was a choice to make, because a Pane that says `1 of 1` invites
+        // the user to look for the other one. #10 deletes this along with the rule that a
+        // Project with several Candidates launches the first of them.
+        if of > 1 {
+            title.push_str(&format!(" · {rank} of {of}"));
+        }
+        title
     }
 }

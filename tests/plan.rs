@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use common::sources;
 use herdr_db::context::InvocationContext;
 use herdr_db::host::{Host, Output};
-use herdr_db::plan::{Diagnosis, Plan, plan};
+use herdr_db::plan::{Diagnosis, Launch, Plan, plan};
 use serde_json::{Value, json};
 
 /// A Host that knows nothing: no file readable, no directory populated, no command
@@ -652,6 +652,225 @@ fn never_panics_whatever_docker_says() {
             "the answer {said} was not declined on",
         );
     }
+}
+
+/// The Launch a scripted Docker plans, or a failure saying what it declined with instead.
+/// Every test below states a container and then reads what it renders to.
+fn launched(host: &dyn Host) -> Launch {
+    match planned_against(host) {
+        Plan::Launch(launch) => launch,
+        Plan::Decline(diagnosis) => panic!(
+            "the container was expected to be a Candidate, and declined: {}",
+            diagnosis.message(),
+        ),
+    }
+}
+
+/// The DSN the Launch carries. It is the Client's positional argument and there is nowhere
+/// else in a Launch for it to be (ADR-0002).
+fn resolved(host: &dyn Host) -> String {
+    launched(host).argv[1].clone()
+}
+
+#[test]
+fn the_dsn_is_the_containers_own_credentials_on_its_published_host_port() {
+    // `docker ps` does not carry a container's environment, so the user, the password and
+    // the database name are read from the matched container's `inspect` — the running
+    // container's environment, not a compose file's (no compose file is read until #5).
+    let host = DockerHost::running(vec![Container {
+        env: vec![
+            "POSTGRES_USER=app",
+            "POSTGRES_PASSWORD=hunter2",
+            "POSTGRES_DB=orders",
+            "PATH=/usr/bin",
+        ],
+        ..container()
+    }]);
+    // The host is the loopback by number and never by name: a machine that resolves the
+    // name to `::1` first fails against a port Docker bound on IPv4 (AC 6).
+    assert_eq!(
+        resolved(&host),
+        "postgres://app:hunter2@127.0.0.1:5434/orders"
+    );
+}
+
+#[test]
+fn the_images_own_defaults_fill_in_whatever_the_container_does_not_say() {
+    // The image applies these itself as it starts, so a container that names nothing is not
+    // a container with no credentials. `POSTGRES_DB` defaults to the *resolved* role rather
+    // than to `postgres`, so naming only the user renames the database with it.
+    for (env, expected) in [
+        (vec![], "postgres://postgres@127.0.0.1:5434/postgres"),
+        (
+            vec!["POSTGRES_USER=app"],
+            "postgres://app@127.0.0.1:5434/app",
+        ),
+        (
+            vec!["POSTGRES_DB=orders"],
+            "postgres://postgres@127.0.0.1:5434/orders",
+        ),
+        // An empty value is a variable the container did not set: Compose writes one from
+        // an unset shell variable, and the image reads it as absent. The same rule the
+        // Project's own tiers apply to the invocation context.
+        (
+            vec!["POSTGRES_USER=", "POSTGRES_DB=", "POSTGRES_PASSWORD="],
+            "postgres://postgres@127.0.0.1:5434/postgres",
+        ),
+    ] {
+        let host = DockerHost::running(vec![Container {
+            env: env.clone(),
+            ..container()
+        }]);
+        assert_eq!(
+            resolved(&host),
+            expected,
+            "the environment {env:?} did not default the way the image defaults it",
+        );
+    }
+}
+
+#[test]
+fn an_absent_password_is_a_dsn_without_one_rather_than_a_guessed_one() {
+    // A container on the default network with trust authentication needs no password, and
+    // a guessed one turns a connection that would have worked into one that is refused.
+    let host = DockerHost::running(vec![Container {
+        env: vec!["POSTGRES_USER=app", "POSTGRES_DB=orders"],
+        ..container()
+    }]);
+    assert_eq!(resolved(&host), "postgres://app@127.0.0.1:5434/orders");
+}
+
+#[test]
+fn the_role_and_the_password_are_percent_encoded_and_the_database_is_left_as_it_reads() {
+    // A password is whatever generated it, and `p@ss/word` written in as it reads is a DSN
+    // naming a different host and a different database — one the Client connects to, or
+    // fails to, with nothing to say about why. The database name is the last thing in the
+    // DSN and stays legible instead.
+    let host = DockerHost::running(vec![Container {
+        env: vec![
+            "POSTGRES_USER=app@corp",
+            "POSTGRES_PASSWORD=p@ss/wo:rd#1",
+            "POSTGRES_DB=orders+dev",
+        ],
+        ..container()
+    }]);
+    assert_eq!(
+        resolved(&host),
+        "postgres://app%40corp:p%40ss%2Fwo%3Ard%231@127.0.0.1:5434/orders+dev",
+    );
+}
+
+#[test]
+fn an_environment_entry_is_split_on_its_first_equals_only() {
+    // Base64 pads with `=`, so a generated password routinely carries one. Cut at the
+    // second `=`, the password is quietly wrong, and the user watches the database refuse
+    // a password they can read in `docker inspect` and see is right.
+    let host = DockerHost::running(vec![Container {
+        env: vec![
+            "POSTGRES_USER=app",
+            "POSTGRES_PASSWORD=c2VjcmV0==",
+            "POSTGRES_DB=orders",
+        ],
+        ..container()
+    }]);
+    assert_eq!(
+        resolved(&host),
+        "postgres://app:c2VjcmV0%3D%3D@127.0.0.1:5434/orders",
+    );
+}
+
+#[test]
+fn the_title_names_the_database_the_origin_and_the_connecting_role() {
+    // The title is the only on-screen statement of what was connected to (ADR-0007), so it
+    // answers the three questions the user has in front of a Client that shows none of
+    // them: which database, where the answer came from, and as whom.
+    assert_eq!(
+        launched(&DockerHost::running(vec![container()])).title,
+        "orders@5434 · docker · app",
+    );
+}
+
+#[test]
+fn the_title_carries_neither_the_password_nor_a_dsn() {
+    // The title is on screen for as long as the Pane is, in front of whoever walks past it
+    // and in whatever the user screenshots (AC 10, ADR-0005). Asserted against a scripted
+    // password rather than by reading the format string, because the format string is the
+    // thing that changes.
+    let title = launched(&DockerHost::running(vec![Container {
+        env: vec![
+            "POSTGRES_USER=app",
+            "POSTGRES_PASSWORD=hunter2",
+            "POSTGRES_DB=orders",
+        ],
+        ..container()
+    }]))
+    .title;
+    assert!(
+        !title.contains("hunter2"),
+        "the title shows the password: {title}"
+    );
+    assert!(!title.contains("://"), "the title shows a DSN: {title}");
+}
+
+#[test]
+fn a_local_candidate_opens_read_write() {
+    // ADR-0005: spot-editing what an agent just wrote is the point of a local database.
+    // Read-only is the Override's default instead, because an Override is by construction
+    // the route to something someone else may be using.
+    assert!(
+        !launched(&DockerHost::running(vec![container()])).read_only,
+        "a container on this machine was opened read-only",
+    );
+}
+
+#[test]
+fn the_lowest_published_port_launches_and_the_title_says_what_it_is_one_of() {
+    // Two containers under one Project is reachable now and the picker is not (#10). Until
+    // it arrives the highest-ranked Candidate launches, and the title says how many there
+    // were so that "this is not the one I meant" is answerable from the screen rather than
+    // from `docker ps`. Scripted in the wrong order, because `docker ps` lists in whichever
+    // order it lists and a rank that depended on it would differ run to run.
+    let host = DockerHost::running(vec![
+        Container {
+            id: "c1",
+            name: "/orders-cache",
+            ports: published(&["5544"]),
+            env: vec!["POSTGRES_DB=cache"],
+            ..container()
+        },
+        container(),
+    ]);
+    let launch = launched(&host);
+    assert_eq!(launch.title, "orders@5434 · docker · app · 1 of 2");
+    assert_eq!(launch.argv[1], "postgres://app@127.0.0.1:5434/orders");
+}
+
+#[test]
+fn two_candidates_on_one_port_are_ordered_by_the_container_name() {
+    // Two stacks can publish the same port on one machine — one of them started while the
+    // other was down. The port cannot separate them, so the name does: the tie-break is the
+    // container's, as Docker names it and without the leading `/` it reports it with, so
+    // the order is the one the user reads in `docker ps` rather than one only this plugin
+    // can see.
+    let host = DockerHost::running(vec![
+        Container {
+            id: "c1",
+            name: "/orders-web",
+            env: vec!["POSTGRES_USER=app", "POSTGRES_DB=web"],
+            ..container()
+        },
+        Container {
+            id: "c0",
+            name: "/orders-api",
+            env: vec!["POSTGRES_USER=app", "POSTGRES_DB=api"],
+            ..container()
+        },
+    ]);
+    assert_eq!(
+        launched(&host).title,
+        "api@5434 · docker · app · 1 of 2",
+        "two containers publishing one port did not resolve by name",
+    );
 }
 
 /// A verified trap, not a style preference (ADR-0004).
