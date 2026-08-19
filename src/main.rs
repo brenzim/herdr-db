@@ -11,7 +11,7 @@ use std::process::{Command, ExitCode};
 use herdr_db::context::InvocationContext;
 use herdr_db::diagnosis::{Turn, diagnosis_screen, on_input};
 use herdr_db::host::RealHost;
-use herdr_db::pane::{self, HERDR, rename_args};
+use herdr_db::pane::{self, HERDR};
 use herdr_db::plan::{Diagnosis, Launch, Plan, plan};
 
 fn main() -> ExitCode {
@@ -66,9 +66,10 @@ fn launch_client(launch: Launch) -> ExitCode {
     // Named here rather than a line later: below the `exec` there is no process left to do
     // it. herdr's own answer is ignored, since a title that did not take is not worth
     // withholding the database over.
-    if let Some(pane_id) = pane::id() {
+    let pane_id = pane::id();
+    if let Some(pane_id) = &pane_id {
         let _ = Command::new(HERDR)
-            .args(rename_args(&pane_id, &launch.title))
+            .args(pane::rename_args(pane_id, &launch.title))
             .output();
     }
 
@@ -79,6 +80,12 @@ fn launch_client(launch: Launch) -> ExitCode {
         ),
         None => "the Client has no program to launch".to_string(),
     };
+
+    // Still here, so the Client never started. The label herdr wrote is durable and would
+    // outlive this process saying the Pane is connected to a database nothing opened.
+    if let Some(pane_id) = &pane_id {
+        let _ = Command::new(HERDR).args(pane::clear_args(pane_id)).output();
+    }
 
     eprintln!("herdr-db: {failure}");
     ExitCode::FAILURE

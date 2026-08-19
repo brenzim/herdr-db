@@ -153,7 +153,8 @@ fn name(inspected: &serde_json::Value) -> String {
 /// that also publishes an exporter publishes two ports and only one of them is a database.
 ///
 /// One port per container, always: Docker repeats a binding once per host address it bound
-/// it on, and a database reachable on both IPv4 and IPv6 is one database.
+/// it on, and a database reachable on both IPv4 and IPv6 is one database. The lowest of the
+/// ones that can be reached, since only a reachable binding is one the DSN can name.
 fn published_port(inspected: &serde_json::Value) -> Option<u16> {
     inspected
         .get("NetworkSettings")?
@@ -161,6 +162,23 @@ fn published_port(inspected: &serde_json::Value) -> Option<u16> {
         .get("5432/tcp")?
         .as_array()?
         .iter()
+        .filter(|binding| reachable(binding))
         .filter_map(|binding| binding.get("HostPort")?.as_str()?.parse().ok())
         .min()
+}
+
+/// The host addresses a binding made on which the loopback the DSN names can reach: the two
+/// wildcards Docker writes for an unrestricted publish, the loopback itself, and the empty
+/// address its API writes when it names none.
+const LOOPBACK: [&str; 5] = ["", "0.0.0.0", "127.0.0.1", "::", "::1"];
+
+/// Whether the host can reach `binding` at the address a Candidate's DSN is written with.
+/// A binding carries the interface it was made on, and `ports: ["192.168.1.10:5434:5432"]`
+/// is bound on that one alone: put in a DSN addressed at the loopback it is a connection
+/// refused, under a Pane title stating which database was resolved.
+fn reachable(binding: &serde_json::Value) -> bool {
+    binding
+        .get("HostIp")
+        .map_or(Some(""), serde_json::Value::as_str)
+        .is_some_and(|address| LOOPBACK.contains(&address))
 }

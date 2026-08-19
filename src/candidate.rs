@@ -57,6 +57,31 @@ fn encoded(value: &str) -> String {
         .collect()
 }
 
+/// The characters that stop being part of a database name and start punctuating the DSN
+/// around it: `/` re-roots the path, `?` and `#` end it, and `%` is what decides whether
+/// any of the encoding here means anything at all.
+const STRUCTURAL: [char; 4] = ['/', '?', '#', '%'];
+
+/// `value` with only [`STRUCTURAL`] and whitespace percent-encoded, for the database name.
+/// Encoding it the way the role and the password are encoded would be just as safe and
+/// unreadable: the name is what the title states and what the user checks the Client against,
+/// so everything that cannot move the boundary between the DSN's parts stays as written.
+fn readable(value: &str) -> String {
+    let mut written = String::with_capacity(value.len());
+    for character in value.chars() {
+        if !STRUCTURAL.contains(&character) && !character.is_whitespace() && !character.is_control()
+        {
+            written.push(character);
+            continue;
+        }
+        let mut utf8 = [0_u8; 4];
+        for byte in character.encode_utf8(&mut utf8).as_bytes() {
+            written.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    written
+}
+
 impl Candidate {
     /// The DSN the Client is launched against.
     pub fn dsn(&self) -> String {
@@ -66,7 +91,8 @@ impl Candidate {
         };
         format!(
             "{SCHEME}://{credentials}@{HOST}:{}/{}",
-            self.port, self.database,
+            self.port,
+            readable(&self.database),
         )
     }
 

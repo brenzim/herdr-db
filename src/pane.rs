@@ -32,10 +32,25 @@ pub fn id() -> Option<String> {
 /// title, which is what makes it survive the Client writing a title of its own. The id
 /// comes first because herdr parses a flag only after it.
 pub fn rename_args(pane_id: &str, title: &str) -> Vec<String> {
+    renaming(pane_id, title)
+}
+
+/// The argv that takes the label back off the Pane `pane_id`.
+///
+/// The label being durable is what makes it worth setting and is also what makes this
+/// necessary: it outlives the process that asked for it, so a Pane named for a database the
+/// Client never opened goes on saying it connected to one.
+pub fn clear_args(pane_id: &str) -> Vec<String> {
+    renaming(pane_id, "--clear")
+}
+
+/// The shape both asks share, so that the ordering they both depend on is stated once: the
+/// id in front, and whatever the label is to become behind it.
+fn renaming(pane_id: &str, label: &str) -> Vec<String> {
     vec![
         "pane".to_string(),
         "rename".to_string(),
         pane_id.to_string(),
-        title.to_string(),
+        label.to_string(),
     ]
 }

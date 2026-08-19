@@ -463,6 +463,51 @@ fn a_port_bound_on_both_ipv4_and_ipv6_is_one_candidate() {
 }
 
 #[test]
+fn only_a_binding_the_dsns_own_host_can_reach_counts() {
+    // A binding carries the host address it was made on, and `ports: ["192.168.1.10:5434:5432"]`
+    // binds that interface and no other. The DSN says `127.0.0.1`, so a binding the loopback
+    // cannot reach is not a port to put in one — resolving it produces a Pane titled after a
+    // database the Client is refused by.
+    let host = DockerHost::running(vec![Container {
+        ports: json!({"5432/tcp": [{"HostIp": "192.168.1.10", "HostPort": "5434"}]}),
+        ..container()
+    }]);
+    assert_eq!(
+        planned_against(&host),
+        found_nothing(),
+        "a port bound only on a LAN address was resolved as reachable on the loopback",
+    );
+
+    // And the lowest port is the lowest of the ones that can be reached: taking the lowest
+    // of all of them picks the binding the DSN cannot use, over the one it can.
+    let host = DockerHost::running(vec![Container {
+        ports: json!({"5432/tcp": [
+            {"HostIp": "127.0.0.1", "HostPort": "5434"},
+            {"HostIp": "192.168.1.10", "HostPort": "5433"},
+        ]}),
+        ..container()
+    }]);
+    assert_eq!(
+        resolved(&host),
+        "postgres://app@127.0.0.1:5434/orders",
+        "the lowest port was taken from a binding the loopback cannot reach",
+    );
+
+    // Every address Docker binds the loopback with: the wildcards it writes for `-p 5434:5432`,
+    // the loopback itself, and the empty one its API writes for an unrestricted binding.
+    for host_ip in ["0.0.0.0", "127.0.0.1", "::", "::1", ""] {
+        let host = DockerHost::running(vec![Container {
+            ports: json!({"5432/tcp": [{"HostIp": host_ip, "HostPort": "5434"}]}),
+            ..container()
+        }]);
+        assert!(
+            matches!(planned_against(&host), Plan::Launch(_)),
+            "a database bound on `{host_ip}` is reachable at 127.0.0.1 and was not matched",
+        );
+    }
+}
+
+#[test]
 fn only_a_postgresql_image_is_a_candidate() {
     // A stack's other containers are brought up from the same compose file and publish
     // ports of their own. Launching a PostgreSQL client at Redis is a worse outcome than
@@ -751,7 +796,7 @@ fn the_role_and_the_password_are_percent_encoded_and_the_database_is_left_as_it_
     // A password is whatever generated it, and `p@ss/word` written in as it reads is a DSN
     // naming a different host and a different database — one the Client connects to, or
     // fails to, with nothing to say about why. The database name is the last thing in the
-    // DSN and stays legible instead.
+    // DSN and stays legible instead, bar the few characters that would re-punctuate it.
     let host = DockerHost::running(vec![Container {
         env: vec![
             "POSTGRES_USER=app@corp",
@@ -764,6 +809,39 @@ fn the_role_and_the_password_are_percent_encoded_and_the_database_is_left_as_it_
         resolved(&host),
         "postgres://app%40corp:p%40ss%2Fwo%3Ard%231@127.0.0.1:5434/orders+dev",
     );
+}
+
+#[test]
+fn a_database_name_that_would_repunctuate_the_dsn_is_encoded() {
+    // `POSTGRES_DB` is whatever the compose file said, and a name written in as it reads can
+    // end the path and start a query, or re-root the path at a different database — which
+    // the Client connects to while the title names the one that was asked for. Only the
+    // characters that punctuate a URI are encoded, so an ordinary name stays readable.
+    for (entry, expected) in [
+        ("POSTGRES_DB=my db", "my%20db"),
+        ("POSTGRES_DB=orders/prod", "orders%2Fprod"),
+        (
+            "POSTGRES_DB=orders?sslmode=disable",
+            "orders%3Fsslmode=disable",
+        ),
+        ("POSTGRES_DB=orders#1", "orders%231"),
+        // `%` too: left alone it makes every encoding above ambiguous — a name really
+        // containing `%2F` would arrive at the Client as one containing `/`.
+        ("POSTGRES_DB=100%", "100%25"),
+        // Untouched, because none of them can move the boundary between the DSN's parts.
+        ("POSTGRES_DB=orders+dev", "orders+dev"),
+        ("POSTGRES_DB=orders-2024_v1.a~b", "orders-2024_v1.a~b"),
+    ] {
+        let host = DockerHost::running(vec![Container {
+            env: vec!["POSTGRES_USER=app", entry],
+            ..container()
+        }]);
+        assert_eq!(
+            resolved(&host),
+            format!("postgres://app@127.0.0.1:5434/{expected}"),
+            "`{entry}` was not written into the DSN safely",
+        );
+    }
 }
 
 #[test]

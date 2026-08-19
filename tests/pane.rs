@@ -6,7 +6,7 @@
 //! terminating itself — because the ordering it has to keep is only observable in a real
 //! Pane that has already `exec`ed.
 
-use herdr_db::pane::rename_args;
+use herdr_db::pane::{clear_args, rename_args};
 
 /// A pane id in herdr's own shape, and a title in the shape `Candidate::title` renders.
 const PANE_ID: &str = "p-7f3a";
@@ -108,6 +108,41 @@ fn a_pane_that_was_given_no_id_still_launches_the_client() {
             );
         }
     }
+}
+
+#[test]
+fn takes_the_name_back_off_a_pane_that_never_reached_the_database() {
+    // The label herdr writes is durable and outlives the process that asked for it, so a
+    // Pane named before a launch that then failed reads for ever as connected to a database
+    // it never opened. Clearing it is the same trap in reverse: `rename <ID> --clear`
+    // parses and `rename --clear <ID>` does not.
+    let args = clear_args(PANE_ID);
+    assert_eq!(args, vec!["pane", "rename", PANE_ID, "--clear"]);
+    assert!(
+        args.iter().position(|arg| arg == PANE_ID) < args.iter().position(|arg| arg == "--clear"),
+        "`--clear` is in front of the pane id, which herdr does not parse: {args:?}",
+    );
+}
+
+/// The other half of the ordering above. `exec` returns only on failure, so the source
+/// below it is exactly the failed-launch path — and that is where the name has to come back
+/// off, because a Pane the Client never started in keeps whatever label it was given.
+#[test]
+fn clears_the_title_only_where_the_client_failed_to_launch() {
+    let clear = MAIN
+        .find("clear_args")
+        .expect("`src/main.rs` must take the name back off a Pane it could not launch in");
+    let exec = MAIN
+        .find(".exec()")
+        .expect("`src/main.rs` must become the Client");
+
+    assert!(
+        clear > exec,
+        "`src/main.rs` clears the Pane's label in front of the `exec`. Everything before \
+         the `exec` runs on the successful launch too, so the title would be taken back off \
+         the Pane that did connect — clear it below the `exec`, which only returns on \
+         failure",
+    );
 }
 
 /// Renaming the Pane is one of the four things the binary does *above* the seam, alongside
