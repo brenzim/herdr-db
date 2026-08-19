@@ -167,10 +167,13 @@ fn published_port(inspected: &serde_json::Value) -> Option<u16> {
         .min()
 }
 
-/// The host addresses a binding made on which the loopback the DSN names can reach: the two
-/// wildcards Docker writes for an unrestricted publish, the loopback itself, and the empty
-/// address its API writes when it names none.
-const LOOPBACK: [&str; 5] = ["", "0.0.0.0", "127.0.0.1", "::", "::1"];
+/// The host addresses a binding made on which the IPv4 loopback the DSN names can reach: the
+/// two wildcards Docker writes for an unrestricted publish, that loopback itself, and the
+/// empty address its API writes when it names none.
+///
+/// `::1` is deliberately not one of them: a binding made there answers on the IPv6 loopback
+/// alone, and the DSN's `127.0.0.1` is refused by it.
+const LOOPBACK: [&str; 4] = ["", "0.0.0.0", "127.0.0.1", "::"];
 
 /// Whether the host can reach `binding` at the address a Candidate's DSN is written with.
 /// A binding carries the interface it was made on, and `ports: ["192.168.1.10:5434:5432"]`

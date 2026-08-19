@@ -493,9 +493,10 @@ fn only_a_binding_the_dsns_own_host_can_reach_counts() {
         "the lowest port was taken from a binding the loopback cannot reach",
     );
 
-    // Every address Docker binds the loopback with: the wildcards it writes for `-p 5434:5432`,
-    // the loopback itself, and the empty one its API writes for an unrestricted binding.
-    for host_ip in ["0.0.0.0", "127.0.0.1", "::", "::1", ""] {
+    // Every address Docker binds the DSN's own loopback with: the wildcards it writes for
+    // `-p 5434:5432`, that loopback itself, and the empty one its API writes for an
+    // unrestricted binding.
+    for host_ip in ["0.0.0.0", "127.0.0.1", "::", ""] {
         let host = DockerHost::running(vec![Container {
             ports: json!({"5432/tcp": [{"HostIp": host_ip, "HostPort": "5434"}]}),
             ..container()
@@ -505,6 +506,36 @@ fn only_a_binding_the_dsns_own_host_can_reach_counts() {
             "a database bound on `{host_ip}` is reachable at 127.0.0.1 and was not matched",
         );
     }
+}
+
+#[test]
+fn a_binding_on_the_ipv6_loopback_alone_is_not_reachable() {
+    // `ports: ["[::1]:5434:5432"]` binds the IPv6 loopback and nothing else, and the DSN is
+    // written at `127.0.0.1` — the two are not interchangeable, so this is the same refused
+    // connection under a confident title that a LAN-only binding is.
+    let host = DockerHost::running(vec![Container {
+        ports: json!({"5432/tcp": [{"HostIp": "::1", "HostPort": "5434"}]}),
+        ..container()
+    }]);
+    assert_eq!(
+        planned_against(&host),
+        found_nothing(),
+        "a port bound only on the IPv6 loopback was resolved as reachable at 127.0.0.1",
+    );
+
+    // And it does not win the lowest-port rule against a binding that can be reached.
+    let host = DockerHost::running(vec![Container {
+        ports: json!({"5432/tcp": [
+            {"HostIp": "::1", "HostPort": "5433"},
+            {"HostIp": "127.0.0.1", "HostPort": "5434"},
+        ]}),
+        ..container()
+    }]);
+    assert_eq!(
+        resolved(&host),
+        "postgres://app@127.0.0.1:5434/orders",
+        "the lowest port was taken from a binding only the IPv6 loopback can reach",
+    );
 }
 
 #[test]
