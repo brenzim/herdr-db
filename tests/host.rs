@@ -1,8 +1,7 @@
-//! The Host port. Nothing below the seam calls it yet — the port exists so that the
-//! Resolution Strategies of #4 can be driven from a test with neither Docker nor a live
-//! PostgreSQL server. What is worth pinning now is its degradation contract: every method
-//! answers with an absence rather than an error, so a Decline is classified from what is
-//! missing and never from the text of an io failure.
+//! The Host port. It is what lets the Live Docker Strategy be driven from a test with
+//! neither Docker nor a live PostgreSQL server. What these pin is its degradation
+//! contract: every method answers with an absence rather than an error, so a Decline is
+//! classified from what is missing and never from the text of an io failure.
 
 mod common;
 

@@ -13,10 +13,18 @@ Worktree of a repository resolves alike (ADR-0003).
 ## Status
 
 The plugin links into herdr, binds an action, and opens a split Pane that identifies the
-Project from herdr's invocation context. Connection Resolution has no Strategy behind it
-yet, so the Pane always declines: it stays open showing why, rather than exiting. Press `r`
-then Enter to run resolution again in place — useful once the reason it declined has
-changed, such as a database you have since started — or `q` then Enter to close the Pane.
+Project from herdr's invocation context. One Resolution Strategy stands behind it: running
+Docker containers are matched to the Project by their Compose working-directory label,
+filtered to PostgreSQL images that publish a host port, and turned into the DSN the Client
+is launched against. The Pane is renamed first — which database is in use, where that
+answer came from, and which role it connected as — because after the launch this process
+is the Client.
+
+Where nothing resolves, whether Docker is absent, its daemon is down or no container
+belongs to the Project, the Pane declines: it stays open showing why, rather than exiting.
+Press `r` then Enter to run resolution again in place — useful once the reason it declined
+has changed, such as a database you have since started — or `q` then Enter to close the
+Pane.
 
 There is deliberately no hardcoded DSN. A Pane that confidently connects to a database it
 did not resolve is the exact failure this plugin exists to prevent, so the Client is not

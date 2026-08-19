@@ -11,6 +11,7 @@ use std::process::{Command, ExitCode};
 use herdr_db::context::InvocationContext;
 use herdr_db::diagnosis::{Turn, diagnosis_screen, on_input};
 use herdr_db::host::RealHost;
+use herdr_db::pane::{HERDR, PANE_ID_VAR, rename_args};
 use herdr_db::plan::{Diagnosis, Launch, Plan, plan};
 
 fn main() -> ExitCode {
@@ -62,6 +63,16 @@ fn wants_retry(diagnosis: &Diagnosis) -> bool {
 /// Client (ADR-0001). Every path here reports rather than panics — a panic in a Pane is a
 /// crash the user watches happen (ADR-0004).
 fn launch_client(launch: Launch) -> ExitCode {
+    // Named here rather than a line later: below the `exec` there is no process left to do
+    // it. A Pane herdr gave no id to is this binary run by hand — nothing to name, and no
+    // reason to refuse the launch — and herdr's own answer is ignored, since a title that
+    // did not take is not worth withholding the database over.
+    if let Ok(pane_id) = std::env::var(PANE_ID_VAR) {
+        let _ = Command::new(HERDR)
+            .args(rename_args(&pane_id, &launch.title))
+            .output();
+    }
+
     let failure = match launch.argv.split_first() {
         Some((program, args)) => format!(
             "could not launch {program}: {}",

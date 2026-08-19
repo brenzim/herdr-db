@@ -1,7 +1,7 @@
 //! The plan seam: the one boundary the whole plugin is tested at.
 //!
 //! Every test here drives `plan()` and asserts on the returned `Plan`, never on which
-//! Resolution Strategy ran — there are none yet, and when there are, these tests must not
+//! Resolution Strategy ran — a Strategy is free to be rewritten, and these tests must not
 //! notice. What a `Plan` says is the behaviour; how it was arrived at is not.
 
 mod common;
@@ -92,7 +92,7 @@ const ORDINARY: &str = r#"{"worktree":{"repo_key":"k","repo_name":"herdr-db",
 fn identifies_the_project_from_the_worktrees_repository_root() {
     // Resolution is keyed on the Project, so every Worktree of a repository resolves alike
     // (ADR-0003) — which is only true if the root wins over the deeper Pane cwd sitting
-    // inside it. With no Resolution Strategy built yet, the Decline names the Project.
+    // inside it. The Host here answers nothing, so the Decline is what names the Project.
     assert_eq!(
         planned(Some(ORDINARY)),
         Plan::Decline(Diagnosis::NoConnectionFound {
