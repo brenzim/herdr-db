@@ -3,3 +3,7 @@
 //! identifies (ADR-0003).
 
 pub mod client;
+pub mod context;
+pub mod diagnosis;
+pub mod host;
+pub mod plan;
