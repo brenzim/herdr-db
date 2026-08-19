@@ -6,11 +6,15 @@
 //! terminating itself — because the ordering it has to keep is only observable in a real
 //! Pane that has already `exec`ed.
 
-use herdr_db::pane::{PANE_ID_VAR, rename_args};
+use herdr_db::pane::rename_args;
 
 /// A pane id in herdr's own shape, and a title in the shape `Candidate::title` renders.
 const PANE_ID: &str = "p-7f3a";
 const TITLE: &str = "orders@5434 · docker · postgres · 1 of 2";
+
+/// The binary's source, for the guards below. Read once: every one of them wants the whole
+/// of it, and a path from `tests/` to `src/` spelled three times breaks three times.
+const MAIN: &str = include_str!("../src/main.rs");
 
 #[test]
 fn asks_herdr_to_rename_the_pane() {
@@ -65,11 +69,10 @@ fn the_title_travels_as_one_argument() {
 /// other way to see it is a real Pane.
 #[test]
 fn applies_the_title_before_execing_the_client() {
-    let main = include_str!("../src/main.rs");
-    let rename = main
+    let rename = MAIN
         .find("rename_args")
         .expect("`src/main.rs` must ask herdr to rename the Pane");
-    let exec = main
+    let exec = MAIN
         .find(".exec()")
         .expect("`src/main.rs` must become the Client");
 
@@ -83,15 +86,15 @@ fn applies_the_title_before_execing_the_client() {
 
 #[test]
 fn a_pane_that_was_given_no_id_still_launches_the_client() {
-    let main = include_str!("../src/main.rs");
-    let reads: Vec<&str> = main
+    let reads: Vec<&str> = MAIN
         .lines()
         .map(str::trim)
-        .filter(|line| line.contains("PANE_ID_VAR"))
+        .filter(|line| line.contains("pane::id"))
         .collect();
     assert!(
         !reads.is_empty(),
-        "`src/main.rs` never reads `{PANE_ID_VAR}`, so herdr's Pane is never named",
+        "`src/main.rs` never asks `pane::id` which Pane it is in, so herdr's Pane is never \
+         named",
     );
 
     // A binary someone ran by hand is given no pane id, and that is not a fault: there is
@@ -113,9 +116,8 @@ fn a_pane_that_was_given_no_id_still_launches_the_client() {
 /// inside the port every Strategy is driven from in tests.
 #[test]
 fn does_not_route_the_rename_through_the_host_port() {
-    let main = include_str!("../src/main.rs");
     assert!(
-        !main.contains("host.run("),
+        !MAIN.contains("host.run("),
         "`src/main.rs` runs a command through the Host port. The Host is what Connection \
          Resolution consults; what `main` does above the seam it does directly",
     );

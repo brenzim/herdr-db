@@ -618,38 +618,44 @@ fn docker_being_absent_or_down_is_a_silent_decline() {
     }
 }
 
-/// A container that matches on everything but `network_settings`, so that the payloads
-/// which are only reachable *after* the image and the label have been read are reachable.
-fn matching(network_settings: &str) -> String {
-    format!(
-        r#"[{{"Name":"/orders-db","Config":{{"Image":"postgres:16","Labels":
-        {{"com.docker.compose.project.working_dir":"{PROJECT}"}},"Env":[]}},
-        "NetworkSettings":{{{network_settings}}}}}]"#
-    )
-}
-
 #[test]
 fn never_panics_whatever_docker_says() {
     // Docker's output is another program's, and its shape is versioned by that program
     // rather than by this one. A panic in a Pane is a crash the user watches happen
     // (ADR-0004), so an answer this plugin cannot read is an answer it declines on.
     for said in [
-        String::new(),
-        "not json at all".to_string(),
-        "{}".to_string(),
-        "[]".to_string(),
-        "[null]".to_string(),
-        r#"[{"Config":42}]"#.to_string(),
-        r#"[{"Config":{"Image":"postgres:16"}}]"#.to_string(),
-        r#"[{"Config":{"Image":null,"Labels":null},"NetworkSettings":null}]"#.to_string(),
-        matching(r#""Ports":{"5432/tcp":"5434"}"#),
-        matching(r#""Ports":{"5432/tcp":[{"HostPort":99999999}]}"#),
-        matching(r#""Ports":{"5432/tcp":[{"HostPort":"99999999"}]}"#),
+        "",
+        "not json at all",
+        "{}",
+        "[]",
+        "[null]",
+        r#"[{"Config":42}]"#,
+        r#"[{"Config":{"Image":"postgres:16"}}]"#,
+        r#"[{"Config":{"Image":null,"Labels":null},"NetworkSettings":null}]"#,
     ] {
         assert_eq!(
-            planned_against(&DockerHost::answering(Docker::Saying(said.clone()))),
+            planned_against(&DockerHost::answering(Docker::Saying(said.to_string()))),
             found_nothing(),
             "the answer {said} was not declined on",
+        );
+    }
+
+    // The port shapes, stated as a container that matches on everything else — they are
+    // only reachable *after* the image and the label have been read, so a payload that
+    // failed to match would never get near them.
+    for ports in [
+        json!({"5432/tcp": "5434"}),
+        json!({"5432/tcp": [{"HostPort": 99_999_999}]}),
+        json!({"5432/tcp": [{"HostPort": "99999999"}]}),
+    ] {
+        let host = DockerHost::running(vec![Container {
+            ports: ports.clone(),
+            ..container()
+        }]);
+        assert_eq!(
+            planned_against(&host),
+            found_nothing(),
+            "the ports {ports} were not declined on",
         );
     }
 }

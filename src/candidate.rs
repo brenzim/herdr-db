@@ -71,12 +71,13 @@ impl Candidate {
     }
 
     /// The Pane title: which database is in use, where the answer came from, and which
-    /// role it connected as — plus which of `of` Candidates this one is.
+    /// role it connected as — plus, when there were several, that this is the first of
+    /// `of` Candidates.
     ///
     /// Never carries the password, and never the DSN it is assembled from the parts of:
     /// the title is on screen for as long as the Pane is, in front of whoever walks past
     /// (AC 10, ADR-0005).
-    pub fn title(&self, rank: usize, of: usize) -> String {
+    pub fn title(&self, of: usize) -> String {
         let mut title = format!(
             "{}@{} · {} · {}",
             self.database,
@@ -85,10 +86,11 @@ impl Candidate {
             self.role,
         );
         // Only when there was a choice to make, because a Pane that says `1 of 1` invites
-        // the user to look for the other one. #10 deletes this along with the rule that a
-        // Project with several Candidates launches the first of them.
+        // the user to look for the other one. Always the first, because the Candidates are
+        // ranked and the highest-ranked one is what launched. #10 deletes this along with
+        // the rule that a Project with several Candidates launches without asking.
         if of > 1 {
-            title.push_str(&format!(" · {rank} of {of}"));
+            title.push_str(&format!(" · 1 of {of}"));
         }
         title
     }

@@ -59,7 +59,7 @@ pub fn plan(context: &InvocationContext, host: &dyn Host) -> Plan {
     };
     Plan::Launch(Launch {
         argv: client::argv(&candidate.dsn()),
-        title: candidate.title(1, of),
+        title: candidate.title(of),
         read_only: candidate.read_only,
     })
 }

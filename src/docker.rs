@@ -10,6 +10,10 @@ use std::path::Path;
 use crate::candidate::{Candidate, Origin};
 use crate::host::Host;
 
+/// The command this Strategy asks about the machine's containers, and the one binary it
+/// needs present. Absent, it is a Strategy that finds nothing rather than a fault.
+const PROGRAM: &str = "docker";
+
 /// The Candidates the running containers of this machine offer `project`.
 pub fn candidates(project: &Path, host: &dyn Host) -> Vec<Candidate> {
     // Once, before anything is compared: the Project arrives as herdr names it, and the
@@ -20,7 +24,7 @@ pub fn candidates(project: &Path, host: &dyn Host) -> Vec<Candidate> {
     };
     let mut found: Vec<Candidate> = running(project, host)
         .iter()
-        .filter_map(|id| host.run("docker", &["inspect", id], project))
+        .filter_map(|id| host.run(PROGRAM, &["inspect", id], project))
         .filter(|inspected| inspected.status == 0)
         .filter_map(|inspected| serde_json::from_str::<serde_json::Value>(&inspected.stdout).ok())
         .filter_map(|inspected| candidate(inspected.get(0)?, &project_root, host))
@@ -29,7 +33,7 @@ pub fn candidates(project: &Path, host: &dyn Host) -> Vec<Candidate> {
     // be one of them: only consistent behaviour is learnable, so a Project resolves to the
     // same Candidate every run. Stated as the two things the order is, rather than derived
     // from the struct, whose field order is not an opinion about which database to open.
-    found.sort_by_key(|candidate| (candidate.port, candidate.container.clone()));
+    found.sort_by(|one, other| (one.port, &one.container).cmp(&(other.port, &other.container)));
     found
 }
 
@@ -38,7 +42,7 @@ pub fn candidates(project: &Path, host: &dyn Host) -> Vec<Candidate> {
 /// `*:5432` open with no container behind it.
 fn running(project: &Path, host: &dyn Host) -> Vec<String> {
     let Some(listed) = host.run(
-        "docker",
+        PROGRAM,
         &["ps", "--filter", "status=running", "--format", "{{.ID}}"],
         project,
     ) else {
