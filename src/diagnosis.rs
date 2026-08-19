@@ -17,6 +17,12 @@ pub const RETRY_KEY: &str = "r";
 /// The key that closes the Pane.
 pub const QUIT_KEY: &str = "q";
 
+/// Clear the screen and put the cursor back at the top of it. Every draw starts with this,
+/// because a retry must *replace* the diagnosis rather than print another copy underneath
+/// it (AC 8) — three presses of the retry key otherwise leave the user reading three stacked
+/// paragraphs with nothing to say which one is the current outcome.
+const CLEAR_SCREEN: &str = "\x1b[2J\x1b[H";
+
 /// What one line of input asks the Pane to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Turn {
@@ -32,9 +38,12 @@ pub enum Turn {
 ///
 /// The diagnosis is the point of the screen and the keys are how the user acts on it, so
 /// both are here: the only documentation reachable from inside a Pane is the Pane itself.
+/// The screen is drawn whole, from a cleared terminal, so that the loop redrawing it after
+/// a retry shows one outcome rather than a growing stack of them.
 pub fn diagnosis_screen(d: &Diagnosis) -> String {
     format!(
-        "herdr-db could not open a database Pane.\n\n\
+        "{CLEAR_SCREEN}\
+         herdr-db could not open a database Pane.\n\n\
          {}\n\n\
          [{RETRY_KEY}] then Enter — try again\n\
          [{QUIT_KEY}] then Enter — close this Pane\n",

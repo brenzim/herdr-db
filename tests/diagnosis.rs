@@ -7,7 +7,7 @@
 
 use std::path::PathBuf;
 
-use herdr_db::diagnosis::{Turn, diagnosis_screen, on_input};
+use herdr_db::diagnosis::{QUIT_KEY, RETRY_KEY, Turn, diagnosis_screen, on_input};
 use herdr_db::plan::Diagnosis;
 
 /// The Project a Decline that has one is about.
@@ -77,15 +77,39 @@ fn the_screen_documents_the_keys_it_accepts() {
     // AC 8 says a *documented* keypress re-runs resolution. The documentation the user can
     // actually reach is the screen in front of them, and it must name Enter too — input is
     // line-based, so a bare `r` does nothing until the line is submitted.
+    // Asserted in the rendered form the user reads, not as the bare letter: the screen's
+    // first line is "herdr-db could not open a database Pane.", so a check for `r` alone
+    // passes on that prose whatever key the Pane actually documents.
+    let documented = [
+        format!("[{RETRY_KEY}]"),
+        format!("[{QUIT_KEY}]"),
+        "Enter".to_string(),
+    ];
     for diagnosis in every_diagnosis() {
         let screen = diagnosis_screen(&diagnosis);
-        for expected in ["r", "q", "Enter"] {
+        for expected in &documented {
             assert!(
-                screen.contains(expected),
+                screen.contains(expected.as_str()),
                 "the screen for {diagnosis:?} never names `{expected}`, so the key that \
                  retries is undocumented where the user is looking. It said: {screen}",
             );
         }
+    }
+}
+
+#[test]
+fn the_screen_replaces_whatever_was_on_it() {
+    // AC 8: a retry re-runs resolution *in place*, replacing the diagnosis with the new
+    // outcome. The Pane's loop redraws by printing this string again, so unless the string
+    // clears the terminal first, three retries leave three stacked paragraphs and no way to
+    // tell which one is the current outcome.
+    for diagnosis in every_diagnosis() {
+        let screen = diagnosis_screen(&diagnosis);
+        assert!(
+            screen.starts_with("\x1b[2J\x1b[H"),
+            "the screen for {diagnosis:?} is drawn under the last one rather than over it. \
+             It said: {screen:?}",
+        );
     }
 }
 
@@ -148,10 +172,15 @@ fn an_unrecognised_key_leaves_the_pane_alive() {
 #[test]
 fn the_pane_binary_never_terminates_itself_mid_flight() {
     let main = include_str!("../src/main.rs");
-    assert!(
-        !main.contains("::exit("),
-        "`src/main.rs` terminates the process directly. On a Decline that closes the Pane \
-         on the diagnosis the user is meant to read (AC 7) — return an `ExitCode` from \
-         `main` instead.",
-    );
+    // Every spelling, not just the qualified one: `use std::process::exit;` and a bare
+    // `exit(1)` is the ordinary way to write this once the path is imported, and `abort()`
+    // ends the process just as dead. A guard that only knows `::exit(` misses both.
+    for call in ["exit(", "abort("] {
+        assert!(
+            !main.contains(call),
+            "`src/main.rs` calls `{call}`, terminating the process directly. On a Decline \
+             that closes the Pane on the diagnosis the user is meant to read (AC 7) — \
+             return an `ExitCode` from `main` instead.",
+        );
+    }
 }

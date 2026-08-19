@@ -144,6 +144,23 @@ fn treats_an_empty_value_as_absent_at_the_tier_it_appears_at() {
 }
 
 #[test]
+fn a_tier_of_an_unexpected_type_falls_through_to_the_one_below_it() {
+    // herdr's schema can grow: a property this plugin reads as a path could arrive as an
+    // object or a tag. That tier has said nothing this plugin understands, which is the
+    // same as saying nothing — the tiers below it are still good and must still be used.
+    // Refusing the whole context instead reports a context herdr sent correctly as invalid
+    // JSON, and throws away a workspace cwd that would have identified the Project.
+    assert_eq!(
+        project_of(r#"{"focused_pane_cwd":{"path":"/work/p"},"workspace_cwd":"/work"}"#),
+        PathBuf::from("/work"),
+    );
+    assert_eq!(
+        project_of(r#"{"worktree":"a tag herdr grew","focused_pane_cwd":"/work/p"}"#),
+        PathBuf::from("/work/p"),
+    );
+}
+
+#[test]
 fn never_panics_whatever_the_context_turns_out_to_be() {
     // A panic in a Pane is a crash the user watches happen (ADR-0004), so there is no
     // payload — from a herdr that changed, or from a variable set by hand — that may be

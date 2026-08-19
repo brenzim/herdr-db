@@ -33,26 +33,22 @@ impl InvocationContext {
     }
 }
 
-/// herdr's context payload, parsed. Every field is optional and unknown fields are ignored,
-/// because herdr's schema makes every property nullable and this plugin must survive a herdr
-/// that grew a property it has never heard of (ADR-0004).
-#[derive(serde::Deserialize)]
+/// herdr's context payload, parsed. Held as the JSON tree rather than as a struct of
+/// concrete fields: herdr's schema makes every property nullable, and a plugin that must
+/// survive a herdr that changed (ADR-0004) cannot let one property of an unexpected *type*
+/// abort the whole parse. Deserializing into concrete fields would do exactly that — a
+/// `focused_pane_cwd` that arrived as an object would throw away a perfectly good
+/// `workspace_cwd` and report the context as unreadable JSON when it plainly is not.
 pub(crate) struct RawContext {
-    worktree: Option<RawWorktree>,
-    focused_pane_cwd: Option<String>,
-    workspace_cwd: Option<String>,
-}
-
-/// The `worktree` object, when herdr was invoked from one.
-#[derive(serde::Deserialize)]
-pub(crate) struct RawWorktree {
-    repo_root: Option<String>,
+    payload: serde_json::Value,
 }
 
 impl RawContext {
-    /// The payload as a structure, or `None` if it is not JSON at all.
+    /// The payload as a context, or `None` if it is not a JSON object — which is the one
+    /// shape that is not a context herdr could have sent, however well-formed it is.
     pub(crate) fn parse(raw: &str) -> Option<Self> {
-        serde_json::from_str(raw).ok()
+        let payload: serde_json::Value = serde_json::from_str(raw).ok()?;
+        payload.is_object().then_some(Self { payload })
     }
 
     /// The Project this context identifies: the Worktree's repository root, falling back
@@ -62,17 +58,20 @@ impl RawContext {
     ///
     /// An empty value is a tier that said nothing, not a path: `find` therefore tests the
     /// tiers one at a time, and a tier that says nothing cannot settle the chain. Filtering
-    /// empties once, after the chain has settled, would root the Project at `/`.
+    /// empties once, after the chain has settled, would root the Project at `/`. A tier
+    /// carrying something that is not a string has said nothing either, and falls through
+    /// the same way rather than taking the whole context down with it.
     pub(crate) fn project(&self) -> Option<PathBuf> {
         [
-            self.worktree
-                .as_ref()
-                .and_then(|worktree| worktree.repo_root.as_deref()),
-            self.focused_pane_cwd.as_deref(),
-            self.workspace_cwd.as_deref(),
+            self.payload
+                .get("worktree")
+                .and_then(|worktree| worktree.get("repo_root")),
+            self.payload.get("focused_pane_cwd"),
+            self.payload.get("workspace_cwd"),
         ]
         .into_iter()
         .flatten()
+        .filter_map(serde_json::Value::as_str)
         .find(|path| !path.is_empty())
         .map(PathBuf::from)
     }
