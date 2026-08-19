@@ -33,6 +33,12 @@ pub trait Host {
     /// command that ran and failed is `Some`, with its status — that is an answer, not an
     /// absence.
     fn run(&self, program: &str, args: &[&str], cwd: &Path) -> Option<Output>;
+
+    /// `path` with every symlink resolved, or `None` if it cannot be resolved at all.
+    /// Deliberately no default body: one that read the real filesystem would put that
+    /// access outside `RealHost`, and one that answered `None` would let a Host silently
+    /// skip a comparison that only holds once both sides are canonical.
+    fn canonicalize(&self, path: &Path) -> Option<PathBuf>;
 }
 
 /// The real world. The only implementation the Pane binary uses, and the only place in the
@@ -66,5 +72,9 @@ impl Host for RealHost {
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         })
+    }
+
+    fn canonicalize(&self, path: &Path) -> Option<PathBuf> {
+        std::fs::canonicalize(path).ok()
     }
 }

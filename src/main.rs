@@ -22,8 +22,6 @@ fn main() -> ExitCode {
 
     loop {
         match plan(&context, &host) {
-            // Wired but unreachable: no Resolution Strategy exists yet, so `plan` declines
-            // everything today.
             Plan::Launch(launch) => return launch_client(launch),
             // Only a retry leaves the screen up; anything else is the user closing the Pane
             // themselves, which is not a failure (AC 7).

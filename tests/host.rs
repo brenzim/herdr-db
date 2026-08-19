@@ -52,6 +52,28 @@ fn the_host_lists_a_directory_and_answers_emptily_for_one_it_cannot() {
 }
 
 #[test]
+fn the_host_canonicalises_a_path_through_its_symlinks() {
+    let dir = scratch("canonicalize");
+    let real = dir.join("real");
+    std::fs::create_dir(&real).expect("create the directory the link points at");
+    let link = dir.join("link");
+    std::os::unix::fs::symlink(&real, &link).expect("link to it");
+
+    assert_eq!(
+        RealHost.canonicalize(&link),
+        RealHost.canonicalize(&real),
+        "a symlink and its target are the same directory, and matching a container to a \
+         Project compares the two",
+    );
+    assert_eq!(
+        RealHost.canonicalize(&dir.join("absent")),
+        None,
+        "a path that is not there cannot be resolved, and that is an absence rather than \
+         a failure",
+    );
+}
+
+#[test]
 fn the_host_runs_a_command_and_answers_nothing_for_one_it_cannot_run() {
     let dir = scratch("run");
 
