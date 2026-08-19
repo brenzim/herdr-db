@@ -21,9 +21,19 @@ fn pane_binary_path() -> PathBuf {
     PathBuf::from(declared.strip_prefix("./").unwrap_or(&declared))
 }
 
+/// The directory holding the toolchain running these tests. Taken from the cargo that
+/// launched them rather than searched for on PATH, so the runs that rearrange PATH can
+/// still name a real cargo and a real rustc.
+fn toolchain_directory() -> PathBuf {
+    PathBuf::from(env!("CARGO"))
+        .parent()
+        .expect("the cargo binary is in a directory")
+        .to_path_buf()
+}
+
 /// This machine's target triple, as cargo names its output directory for it.
 fn host_triple() -> String {
-    let out = Command::new("rustc")
+    let out = Command::new(toolchain_directory().join("rustc"))
         .arg("-vV")
         .output()
         .expect("ask rustc for the host triple");
@@ -32,17 +42,6 @@ fn host_triple() -> String {
         .find_map(|line| line.strip_prefix("host: "))
         .expect("rustc reports a host triple")
         .to_string()
-}
-
-/// Where rustc actually lives, for the run that hides it from PATH but still needs the
-/// build itself to compile.
-fn real_rustc() -> String {
-    let out = Command::new("/bin/sh")
-        .arg("-c")
-        .arg("command -v rustc")
-        .output()
-        .expect("ask the shell where rustc is");
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
 fn plugin_root() -> PathBuf {
@@ -79,6 +78,24 @@ fn fresh_copy_of_the_source_tree(label: &str) -> PathBuf {
         assert!(copied.success(), "failed to copy {item}");
     }
     tree
+}
+
+/// A CARGO_HOME holding no `env` file, for the runs that must keep control of PATH: sourcing
+/// rustup's env file puts $HOME/.cargo/bin ahead of everything a test put there, and the build
+/// step consults HOME for nothing else. The real registry is linked in because cargo resolves
+/// the whole manifest — dev-dependencies included — before building anything, and an untouched
+/// CARGO_HOME would send it to the network for an index it already has a copy of.
+fn cargo_home_without_an_env_file(label: &str) -> PathBuf {
+    let dir = scratch(label);
+    let real = std::env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cargo")))
+        .unwrap_or_default();
+    let registry = real.join("registry");
+    if registry.is_dir() {
+        symlink(&registry, dir.join("registry")).expect("link the registry in");
+    }
+    dir
 }
 
 /// A directory holding an executable stub named after the Client, for the runs that need
@@ -453,11 +470,13 @@ fn builds_for_this_machine_even_when_the_environment_names_another_target() {
 }
 
 #[test]
-fn installs_a_native_build_when_rustc_cannot_say_which_machine_this_is() {
+fn refuses_to_install_when_rustc_cannot_say_which_machine_this_is() {
     // A rustup shim with no default toolchain answers `rustc -vV` with an error, so there is
-    // no host triple to compare the artifact's path against. That comparison is the only
-    // thing that recognises a native `target/<triple>/release` build as native, and a build
-    // that cannot be checked must not be condemned: this one runs here.
+    // no host triple to compare the artifact's path against — and that comparison is the only
+    // thing that tells a native `target/<triple>/release` build from a foreign one. Installing
+    // anyway would drop the foreign-binary guard rather than degrade it, moving the failure to
+    // the user's first keypress; refusing costs nothing, since a build with no triple in its
+    // path never reaches this case at all.
     let tree = fresh_copy_of_the_source_tree("no-rustc-tree");
     configure_cargo_target(&tree, &host_triple());
 
@@ -470,9 +489,18 @@ fn installs_a_native_build_when_rustc_cannot_say_which_machine_this_is() {
     .expect("write the failing rustc");
     fs::set_permissions(&failing_rustc, fs::Permissions::from_mode(0o755))
         .expect("make the failing rustc executable");
+
+    // Nothing may prepend a directory ahead of the shim, or the real rustc answers and the run
+    // proves nothing about the case this test is named for. rustup's env script does exactly
+    // that, on every machine whose PATH does not already hold the string it looks for — so the
+    // build step is given a CARGO_HOME with no env file to source. The toolchain is then named
+    // on PATH outright, behind the shim, so the build still compiles on a machine that reaches
+    // cargo only through the env file that is now never sourced.
+    let cargo_home = cargo_home_without_an_env_file("no-rustc-cargo-home");
     let path = format!(
-        "{}:{}",
+        "{}:{}:{}",
         shims.display(),
+        toolchain_directory().display(),
         std::env::var("PATH").unwrap_or_default(),
     );
 
@@ -480,51 +508,49 @@ fn installs_a_native_build_when_rustc_cannot_say_which_machine_this_is() {
         .arg("scripts/build.sh")
         .current_dir(&tree)
         .env("PATH", &path)
+        .env("CARGO_HOME", &cargo_home)
         // cargo is told where rustc really is, so the build itself still runs while the
         // build step's own `rustc -vV` finds only the failing shim ahead of it on PATH.
-        .env("RUSTC", real_rustc())
+        .env("RUSTC", toolchain_directory().join("rustc"))
         .output()
         .expect("run the build step");
     let said = everything_said(&out);
 
     assert!(
-        out.status.success(),
-        "a native build must install even when rustc cannot be asked to confirm it is \
-         native, but the build step said:\n{said}",
+        !out.status.success(),
+        "a build that cannot be confirmed as this machine's must not install, but the build \
+         step said:\n{said}",
     );
     assert!(
-        said.contains("did not report a host triple"),
+        said.contains("rustc could not say which machine this is"),
         "the run did not reach the unknown-host case at all, so it proves nothing about it \
          — the shim must be the rustc the build step finds. It said:\n{said}",
     );
     assert!(
-        tree.join(pane_binary_path()).is_file(),
-        "the Pane binary is missing from the path the manifest names",
+        !tree.join(pane_binary_path()).is_file(),
+        "an unconfirmed binary reached the manifest's path, so the Pane would run it",
     );
 }
 
 #[test]
 fn installs_the_pane_binary_even_when_the_build_produces_other_executables() {
-    // Taking the last executable cargo reports is only right while this crate has exactly
-    // one. A second [[bin]] — or an example, or a build script — reports one too, and which
-    // is reported last is a question about compilation order. Installing that one hands the
-    // Pane a program that is not the Pane.
+    // Only the Pane binary may reach the manifest's path. A second [[bin]] — or an example, or
+    // a build script — is reported as an executable of this build just as the Pane binary is,
+    // and installing one of those would hand the Pane a program that is not the Pane.
     let tree = fresh_copy_of_the_source_tree("two-bins-tree");
     let manifest = tree.join("Cargo.toml");
     let mut declared = fs::read_to_string(&manifest).expect("read the manifest");
     declared.push_str("\n[[bin]]\nname = \"other-tool\"\npath = \"src/other_tool.rs\"\n");
     fs::write(&manifest, declared).expect("declare a second binary");
 
-    // The second binary is padded until it takes longer to compile than the Pane binary, so
-    // that cargo reports it last on every run. Which artifact comes last is otherwise cargo's
-    // business, and a test that only sometimes meets the ordering it is about proves nothing.
-    let mut other_tool = String::from("fn main() {\n    std::process::exit(97);\n}\n");
-    for n in 0..4000 {
-        other_tool.push_str(&format!(
-            "#[allow(dead_code)]\nfn f{n}(x: u64) -> u64 {{ x.wrapping_mul({n}).wrapping_add({n}) }}\n"
-        ));
-    }
-    fs::write(tree.join("src").join("other_tool.rs"), other_tool).expect("write the second binary");
+    // The second binary only has to be distinguishable from the Pane binary when run, which
+    // an exit status nothing else produces is enough for. Nothing here depends on the order
+    // cargo reports the two in: the build step picks by name, not by position.
+    fs::write(
+        tree.join("src").join("other_tool.rs"),
+        "fn main() {\n    std::process::exit(97);\n}\n",
+    )
+    .expect("write the second binary");
 
     let path = path_with_a_stub_client("two-bins-path");
     let out = Command::new("/bin/sh")

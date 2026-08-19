@@ -83,9 +83,13 @@ cargo build --release --target-dir target --message-format=json-render-diagnosti
 # build script, an example or a second [[bin]] each report one too, and which of them comes
 # last is a question about compilation order. Installing that one would put a program that is
 # not the Pane at the path the manifest names.
+#
+# The name is taken from $binary rather than spelled again, so renaming the [[bin]] cannot
+# leave this matching nothing — which would fail the install as "no executable reported",
+# telling the user to file a bug about a change made inside this repo.
 built="$(
   grep '"reason":"compiler-artifact"' "$artifacts" \
-    | grep '"name":"herdr-db"' \
+    | grep "\"name\":\"${binary##*/}\"" \
     | sed -n 's/.*"executable":"\([^"]*\)".*/\1/p' \
     | tail -1
 )"
@@ -103,17 +107,22 @@ fi
 #
 # An unanswerable `rustc -vV` — no rustc on PATH, or a rustup shim with no default toolchain —
 # leaves `host` empty, which makes the second pattern unmatchable and sends every triple path
-# to the last branch. That case is handled there rather than being read as a foreign build.
+# to the last branch. Refusing there degrades nothing that a plain target/release build relies
+# on: without a triple in the path the `case` never reaches that branch at all.
 host="$(rustc -vV 2>/dev/null | sed -n 's/^host: //p')"
 case "$built" in
-  */target/release/herdr-db) ;;
-  */target/"$host"/release/herdr-db) ;;
+  */target/release/"${binary##*/}") ;;
+  */target/"$host"/release/"${binary##*/}") ;;
   *)
     if [ -z "$host" ]; then
-      echo "herdr-db: rustc did not report a host triple, so the build could not be checked" >&2
-      echo "for being this machine's. Installing what cargo reported:" >&2
+      echo "herdr-db: the build landed under a target triple:" >&2
       echo "" >&2
       echo "    $built" >&2
+      echo "" >&2
+      echo "and rustc could not say which machine this is, so the binary could not be" >&2
+      echo "confirmed as runnable here and was not installed. Make \`rustc -vV\` answer — a" >&2
+      echo "rustup install with no default toolchain does not — and install this plugin again." >&2
+      exit 1
     else
       echo "herdr-db: the build produced a binary for another machine:" >&2
       echo "" >&2
