@@ -1,9 +1,7 @@
 //! The diagnosis Pane: what it draws, and what a key means.
 //!
-//! A `Decline` nobody can read is not demoable behaviour, so the Pane stays alive showing
-//! why resolution declined and offers a documented key to run it again in place. The Pane's
-//! terminal I/O — print the screen, read a line, loop — stays manually verified; the two
-//! decisions worth testing are what the screen says and what a line of input means.
+//! The Pane's terminal I/O — print the screen, read a line, loop — stays manually verified;
+//! the two decisions worth testing are what the screen says and what a line of input means.
 
 use std::path::PathBuf;
 
@@ -76,10 +74,9 @@ fn the_screen_says_why_resolution_declined() {
 fn the_screen_documents_the_keys_it_accepts() {
     // AC 8 says a *documented* keypress re-runs resolution. The documentation the user can
     // actually reach is the screen in front of them, and it must name Enter too — input is
-    // line-based, so a bare `r` does nothing until the line is submitted.
-    // Asserted in the rendered form the user reads, not as the bare letter: the screen's
-    // first line is "herdr-db could not open a database Pane.", so a check for `r` alone
-    // passes on that prose whatever key the Pane actually documents.
+    // line-based, so a bare `r` does nothing until the line is submitted. The keys are
+    // asserted in their rendered form, not as bare letters, so the check cannot be satisfied
+    // by the screen's own prose.
     let documented = [
         format!("[{RETRY_KEY}]"),
         format!("[{QUIT_KEY}]"),
@@ -165,17 +162,16 @@ fn an_unrecognised_key_leaves_the_pane_alive() {
 }
 
 /// AC 7, guarded in the source because the Pane's loop — print, read a line, loop — is the
-/// part that stays manually verified. The walking skeleton's `main` ended *every* path with
-/// `std::process::exit(1)`; a Decline that kept taking it would close the Pane on the very
-/// screen the user needs to read. `main` returns an exit code instead, so no path can
-/// terminate the process out from under the loop.
+/// part that stays manually verified. The walking skeleton's `main` ended every path that
+/// returned at all with `std::process::exit(1)`; a Decline that kept taking it would close
+/// the Pane on the very screen the user needs to read. `main` returns an exit code instead,
+/// so no path can terminate the process out from under the loop.
 #[test]
 fn the_pane_binary_never_terminates_itself_mid_flight() {
     let main = include_str!("../src/main.rs");
     // Both terminators, and both spellings of each: the qualified call, and the import that
-    // is what makes a bare `exit(1)` writable at all. Matching call shapes rather than a
-    // bare `exit(`/`abort(` substring keeps that coverage without failing the day someone
-    // writes the word in a doc comment or names a helper `wants_exit`.
+    // is what makes a bare `exit(1)` writable at all. Matched as call shapes rather than as
+    // bare `exit(`/`abort(` substrings, which the word in a doc comment would trip.
     for name in ["exit", "abort"] {
         let call = format!("process::{name}(");
         assert!(
@@ -184,8 +180,6 @@ fn the_pane_binary_never_terminates_itself_mid_flight() {
              that closes the Pane on the diagnosis the user is meant to read (AC 7) — \
              return an `ExitCode` from `main` instead.",
         );
-        // Grouped or single, `use std::process::{{exit}}` is the only way a bare `exit(1)`
-        // compiles, so the import is the shape to catch.
         let import = main.lines().map(str::trim_start).find(|line| {
             line.starts_with("use ") && line.contains("process::") && line.contains(name)
         });

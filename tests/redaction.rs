@@ -4,13 +4,7 @@
 //! it is displayed or logged — "a future debugging change that logs a raw DSN is a security
 //! regression". This is that regression, caught in source.
 //!
-//! The guard is written before the first DSN exists, which is exactly when a guard of this
-//! kind is worth having: no Resolution Strategy has been built yet, so the only DSN the
-//! plugin ever held was the walking skeleton's hardcoded one, and it is gone. Scanning all
-//! of `src/` with no exemption — `src/client.rs` included, which takes a `dsn: &str` and
-//! holds no literal of its own — is a stronger statement than a scan with carve-outs, and
-//! there is less of it to explain. Written in the idiom `tests/launcher.rs` already uses to
-//! keep the README from recommending what the launcher refuses to do.
+//! All of `src/` is scanned with no exemption, `src/client.rs` included.
 
 mod common;
 
@@ -54,8 +48,6 @@ fn no_source_file_carries_a_dsn_literal() {
 
 #[test]
 fn no_source_file_displays_a_dsn() {
-    // Built once rather than per line: the forms are constants, and re-deriving them for
-    // every line of every source file is the whole of this test's work.
     let interpolated = SECRET_BEARING.map(|name| format!("{{{name}"));
 
     for (file, text) in sources() {

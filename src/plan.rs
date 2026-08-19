@@ -45,8 +45,6 @@ pub fn plan(context: &InvocationContext, _host: &dyn Host) -> Plan {
     let Some(parsed) = RawContext::parse(raw) else {
         return Plan::Decline(Diagnosis::ContextUnreadable);
     };
-    // A context that parsed is a herdr that spoke correctly, whatever it did or did not
-    // name — never an unreadable one.
     let Some(project) = parsed.project() else {
         return Plan::Decline(Diagnosis::NoProjectIdentified);
     };

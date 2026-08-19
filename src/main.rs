@@ -2,9 +2,7 @@
 //! the Client *is* the Pane rather than something this process wraps (ADR-0001).
 //!
 //! Everything decided here is decided by [`plan`]: this file reads the invocation context,
-//! hands it and the real world to the seam, and does what comes back. A `Launch` becomes
-//! the Client; a `Decline` becomes a screen the user can read and act on, and the Pane stays
-//! open until they close it themselves.
+//! hands it and the real world to the seam, and does what comes back.
 
 use std::io::{BufRead, Write};
 use std::os::unix::process::CommandExt;
@@ -25,11 +23,10 @@ fn main() -> ExitCode {
     loop {
         match plan(&context, &host) {
             // Wired but unreachable: no Resolution Strategy exists yet, so `plan` declines
-            // everything today. What lights this arm up is a Strategy, not a rewrite here.
+            // everything today.
             Plan::Launch(launch) => return launch_client(launch),
             // Only a retry leaves the screen up; anything else is the user closing the Pane
-            // themselves, which is not a failure. Nothing else leaves this loop: a Decline
-            // keeps its screen up (AC 7).
+            // themselves, which is not a failure (AC 7).
             Plan::Decline(diagnosis) if wants_retry(&diagnosis) => continue,
             Plan::Decline(_) => return ExitCode::SUCCESS,
         }

@@ -5,9 +5,8 @@
 //! decisions worth testing live here — the screen's text and a line of input's meaning.
 //! The loop around them (print, read a line, repeat) is `main`'s, and is verified by hand.
 //!
-//! Input is line-based rather than raw-mode: the screen shows one paragraph, and a raw-mode
-//! setup and teardown that has to survive `exec` and panics buys nothing for it. The cost is
-//! that every key needs Enter after it, which is why the screen says so.
+//! Input is line-based rather than raw-mode, so every key needs Enter after it — which is
+//! why the screen says so.
 
 use crate::plan::Diagnosis;
 
@@ -19,8 +18,7 @@ pub const QUIT_KEY: &str = "q";
 
 /// Clear the screen and put the cursor back at the top of it. Every draw starts with this,
 /// because a retry must *replace* the diagnosis rather than print another copy underneath
-/// it (AC 8) — three presses of the retry key otherwise leave the user reading three stacked
-/// paragraphs with nothing to say which one is the current outcome.
+/// it (AC 8).
 const CLEAR_SCREEN: &str = "\x1b[2J\x1b[H";
 
 /// What one line of input asks the Pane to do.
@@ -38,8 +36,6 @@ pub enum Turn {
 ///
 /// The diagnosis is the point of the screen and the keys are how the user acts on it, so
 /// both are here: the only documentation reachable from inside a Pane is the Pane itself.
-/// The screen is drawn whole, from a cleared terminal, so that the loop redrawing it after
-/// a retry shows one outcome rather than a growing stack of them.
 pub fn diagnosis_screen(d: &Diagnosis) -> String {
     format!(
         "{CLEAR_SCREEN}\
@@ -52,15 +48,10 @@ pub fn diagnosis_screen(d: &Diagnosis) -> String {
 }
 
 /// What one line of input means.
-///
-/// Retry runs `plan()` again with the *same* invocation context: herdr fixed that for the
-/// life of the process, and what changes between attempts is the world behind the `Host` —
-/// the user starting the database they were told was missing.
 pub fn on_input(line: &str) -> Turn {
     // EOF, and only EOF: `read_line` on a closed stdin writes nothing and returns `Ok(0)`,
-    // for ever. Ignoring that spins the loop and burns a core in a Pane the user is looking
-    // at. A user who merely pressed Enter submitted "\n", which is a different thing and
-    // must not close their Pane.
+    // for ever. A bare Enter submits "\n", which is a different thing and must not close
+    // the user's Pane.
     if line.is_empty() {
         return Turn::Quit;
     }
@@ -69,8 +60,7 @@ pub fn on_input(line: &str) -> Turn {
     match line.trim().to_ascii_lowercase().as_str() {
         RETRY_KEY => Turn::Retry,
         QUIT_KEY => Turn::Quit,
-        // Including an empty line: the user said nothing, so nothing happens (AC 7 — the
-        // Pane stays alive on a Decline, and an unknown key is no reason to take it away).
+        // Including an empty line: the user said nothing, so nothing happens (AC 7).
         _ => Turn::Ignore,
     }
 }

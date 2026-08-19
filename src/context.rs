@@ -36,16 +36,16 @@ impl InvocationContext {
 /// herdr's context payload, parsed. Held as the JSON tree rather than as a struct of
 /// concrete fields: herdr's schema makes every property nullable, and a plugin that must
 /// survive a herdr that changed (ADR-0004) cannot let one property of an unexpected *type*
-/// abort the whole parse. Deserializing into concrete fields would do exactly that — a
-/// `focused_pane_cwd` that arrived as an object would throw away a perfectly good
-/// `workspace_cwd` and report the context as unreadable JSON when it plainly is not.
+/// abort the whole parse. Deserializing into concrete fields would do exactly that.
 pub(crate) struct RawContext {
     payload: serde_json::Value,
 }
 
 impl RawContext {
-    /// The payload as a context, or `None` if it is not a JSON object — which is the one
-    /// shape that is not a context herdr could have sent, however well-formed it is.
+    /// The payload as a context, or `None` if it is not a JSON object — the one shape that
+    /// is no context herdr could have sent, however well-formed it is. `plan()` reports that
+    /// `None` as `ContextUnreadable`, so a well-formed payload of the wrong shape is
+    /// described to the user as invalid JSON.
     pub(crate) fn parse(raw: &str) -> Option<Self> {
         let payload: serde_json::Value = serde_json::from_str(raw).ok()?;
         payload.is_object().then_some(Self { payload })
@@ -58,9 +58,10 @@ impl RawContext {
     ///
     /// An empty value is a tier that said nothing, not a path: `find` therefore tests the
     /// tiers one at a time, and a tier that says nothing cannot settle the chain. Filtering
-    /// empties once, after the chain has settled, would root the Project at `/`. A tier
-    /// carrying something that is not a string has said nothing either, and falls through
-    /// the same way rather than taking the whole context down with it.
+    /// empties once, after the chain has settled, would identify the Project as the empty
+    /// path, which is relative and silently re-roots every subsequent join at the process's
+    /// own location. A tier carrying something that is not a string has said nothing either,
+    /// and falls through the same way rather than taking the whole context down with it.
     pub(crate) fn project(&self) -> Option<PathBuf> {
         [
             self.payload

@@ -87,8 +87,7 @@ const ORDINARY: &str = r#"{"worktree":{"repo_key":"k","repo_name":"herdr-db",
 fn identifies_the_project_from_the_worktrees_repository_root() {
     // Resolution is keyed on the Project, so every Worktree of a repository resolves alike
     // (ADR-0003) — which is only true if the root wins over the deeper Pane cwd sitting
-    // inside it. With no Resolution Strategy built yet, an identified Project can only
-    // decline for want of a connection, and that Decline names the Project it looked for.
+    // inside it. With no Resolution Strategy built yet, the Decline names the Project.
     assert_eq!(
         planned(Some(ORDINARY)),
         Plan::Decline(Diagnosis::NoConnectionFound {
@@ -130,8 +129,9 @@ fn falls_back_to_the_workspace_cwd_when_no_pane_is_focused() {
 fn treats_an_empty_value_as_absent_at_the_tier_it_appears_at() {
     // A herdr that names a Worktree but gives it an empty root has said nothing at that
     // tier, so the chain must go on to the next one. Filtering empties once, after the
-    // chain has already settled on the empty root, yields the filesystem root instead —
-    // which resolves every Project to `/` and looks entirely successful while doing it.
+    // chain has already settled on the empty root, identifies the Project as the empty
+    // path — relative, re-rooting every subsequent join at wherever the process happens to
+    // be, and looking entirely successful while doing it.
     assert_eq!(
         project_of(r#"{"worktree":{"repo_root":""},"focused_pane_cwd":"/work/p"}"#),
         PathBuf::from("/work/p"),
@@ -186,10 +186,7 @@ fn never_panics_whatever_the_context_turns_out_to_be() {
     }
 }
 
-/// A verified trap, not a style preference: a plugin Pane's process starts in the *plugin's
-/// install directory*, not in the Worktree the user invoked it from (ADR-0004). Asking the
-/// process where it is would therefore resolve every Project to this plugin — confidently,
-/// and with no symptom other than the wrong database.
+/// A verified trap, not a style preference (ADR-0004).
 ///
 /// `plan()`'s signature already makes the mistake unreachable: neither the invocation
 /// context nor the Host offers a working directory. This guards the tier below that, where
