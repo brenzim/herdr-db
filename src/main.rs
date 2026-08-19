@@ -27,20 +27,19 @@ fn main() -> ExitCode {
             // Wired but unreachable: no Resolution Strategy exists yet, so `plan` declines
             // everything today. What lights this arm up is a Strategy, not a rewrite here.
             Plan::Launch(launch) => return launch_client(launch),
-            Plan::Decline(diagnosis) => match diagnose(&diagnosis) {
-                Turn::Retry => continue,
-                // The user closed the Pane themselves, which is not a failure. Nothing else
-                // leaves this loop: a Decline keeps its screen up (AC 7).
-                Turn::Quit | Turn::Ignore => return ExitCode::SUCCESS,
-            },
+            // Only a retry leaves the screen up; anything else is the user closing the Pane
+            // themselves, which is not a failure. Nothing else leaves this loop: a Decline
+            // keeps its screen up (AC 7).
+            Plan::Decline(diagnosis) if wants_retry(&diagnosis) => continue,
+            Plan::Decline(_) => return ExitCode::SUCCESS,
         }
     }
 }
 
-/// Shows `diagnosis` and waits for the user to say what to do about it. Returns only once
-/// they have asked for a retry or for the Pane to close — an unrecognised key leaves the
-/// screen exactly as it is.
-fn diagnose(diagnosis: &Diagnosis) -> Turn {
+/// Shows `diagnosis` and waits for the user to say what to do about it: `true` if they
+/// asked to run resolution again, `false` if they asked to close the Pane. Returns for
+/// nothing else — an unrecognised key leaves the screen exactly as it is.
+fn wants_retry(diagnosis: &Diagnosis) -> bool {
     print!("{}", diagnosis_screen(diagnosis));
     // A Pane's stdout is a PTY, so the prompt has to be flushed before the read that
     // follows it, or the user waits at a screen that has not been drawn.
@@ -53,11 +52,13 @@ fn diagnose(diagnosis: &Diagnosis) -> Turn {
         // A stdin that cannot be read is a stdin that will not be read again: treat it as
         // the EOF it effectively is rather than looping on the error for ever.
         if stdin.read_line(&mut line).is_err() {
-            return Turn::Quit;
+            return false;
         }
         match on_input(&line) {
+            Turn::Retry => return true,
+            Turn::Quit => return false,
+            // An unrecognised key is no reason to take the screen away, so keep waiting.
             Turn::Ignore => continue,
-            turn => return turn,
         }
     }
 }

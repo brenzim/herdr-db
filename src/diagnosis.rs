@@ -12,10 +12,10 @@
 use crate::plan::Diagnosis;
 
 /// The key that runs resolution again, as the screen documents it and `on_input` accepts it.
-pub const RETRY_KEY: char = 'r';
+pub const RETRY_KEY: &str = "r";
 
 /// The key that closes the Pane.
-pub const QUIT_KEY: char = 'q';
+pub const QUIT_KEY: &str = "q";
 
 /// What one line of input asks the Pane to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,13 +55,11 @@ pub fn on_input(line: &str) -> Turn {
     if line.is_empty() {
         return Turn::Quit;
     }
-    // One key and nothing else, however it was typed: a line carries its newline, and a
+    // The key and nothing else, however it was typed: a line carries its newline, and a
     // capital or a stray space is the same keypress. `quit` spelled out is not.
-    let key = line.trim().to_ascii_lowercase();
-    let mut key = key.chars();
-    match (key.next(), key.next()) {
-        (Some(RETRY_KEY), None) => Turn::Retry,
-        (Some(QUIT_KEY), None) => Turn::Quit,
+    match line.trim().to_ascii_lowercase().as_str() {
+        RETRY_KEY => Turn::Retry,
+        QUIT_KEY => Turn::Quit,
         // Including an empty line: the user said nothing, so nothing happens (AC 7 — the
         // Pane stays alive on a Decline, and an unknown key is no reason to take it away).
         _ => Turn::Ignore,

@@ -12,7 +12,9 @@
 //! there is less of it to explain. Written in the idiom `tests/launcher.rs` already uses to
 //! keep the README from recommending what the launcher refuses to do.
 
-use std::path::{Path, PathBuf};
+mod common;
+
+use common::sources;
 
 /// The URL schemes a PostgreSQL DSN is written with. A literal in either form is a
 /// credential someone has typed into the repository.
@@ -36,8 +38,7 @@ const SECRET_BEARING: [&str; 2] = ["dsn", "argv"];
 
 #[test]
 fn no_source_file_carries_a_dsn_literal() {
-    for file in sources() {
-        let text = std::fs::read_to_string(&file).expect("read the source file");
+    for (file, text) in sources() {
         for scheme in SCHEMES {
             assert!(
                 !text.contains(scheme),
@@ -53,24 +54,26 @@ fn no_source_file_carries_a_dsn_literal() {
 
 #[test]
 fn no_source_file_displays_a_dsn() {
-    for file in sources() {
-        let text = std::fs::read_to_string(&file).expect("read the source file");
+    // Built once rather than per line: the forms are constants, and re-deriving them for
+    // every line of every source file is the whole of this test's work.
+    let interpolated = SECRET_BEARING.map(|name| format!("{{{name}"));
+
+    for (file, text) in sources() {
         for (number, line) in text.lines().enumerate() {
             // Prose is allowed to discuss the DSN; only code that shows one is the fault.
             if line.trim_start().starts_with("//") {
                 continue;
             }
-            // Two ways to show a secret: interpolate it by name anywhere, or hand it to
-            // something that displays. Either is enough on its own.
-            let interpolated = SECRET_BEARING
+            // Two ways to show a secret: interpolate it by name anywhere, or name it on a
+            // line that displays. Either is enough on its own.
+            let displays = DISPLAY_MACROS.iter().any(|display| line.contains(display));
+            let shown = SECRET_BEARING
                 .iter()
-                .find(|name| line.contains(&format!("{{{name}")));
-            let displayed = DISPLAY_MACROS
-                .iter()
-                .any(|display| line.contains(display))
-                .then(|| SECRET_BEARING.iter().find(|name| line.contains(*name)))
-                .flatten();
-            let shown = interpolated.or(displayed);
+                .zip(&interpolated)
+                .find(|(name, form)| {
+                    line.contains(form.as_str()) || (displays && line.contains(*name))
+                })
+                .map(|(name, _)| name);
             assert!(
                 shown.is_none(),
                 "{}:{} shows a `{}` to the user or to a log. Every DSN is redacted wherever \
@@ -80,33 +83,6 @@ fn no_source_file_displays_a_dsn() {
                 shown.copied().unwrap_or_default(),
                 line.trim(),
             );
-        }
-    }
-}
-
-/// Every Rust source file the plugin is built from.
-fn sources() -> Vec<PathBuf> {
-    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut found = Vec::new();
-    collect(&src, &mut found);
-    assert!(
-        found.len() > 1,
-        "found {} source files under {} — the scan is looking in the wrong place, and a \
-         guard that scans nothing passes for ever",
-        found.len(),
-        src.display(),
-    );
-    found
-}
-
-fn collect(dir: &Path, found: &mut Vec<PathBuf>) {
-    let entries = std::fs::read_dir(dir).expect("list the source directory");
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect(&path, found);
-        } else if path.extension().is_some_and(|kind| kind == "rs") {
-            found.push(path);
         }
     }
 }

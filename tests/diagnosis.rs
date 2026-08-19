@@ -10,8 +10,11 @@ use std::path::PathBuf;
 use herdr_db::diagnosis::{Turn, diagnosis_screen, on_input};
 use herdr_db::plan::Diagnosis;
 
-/// Every `Diagnosis` the plugin can show. Listed out so that a new fault has to be given a
-/// screen of its own rather than inheriting one silently.
+/// The Project a Decline that has one is about.
+const PROJECT: &str = "/Users/b/AI/herdr-db";
+
+/// Every `Diagnosis` the plugin can show, the one that names a Project last. Listed out so
+/// that a new fault has to be given a screen of its own rather than inheriting one silently.
 fn every_diagnosis() -> Vec<Diagnosis> {
     vec![
         Diagnosis::ContextMissing,
@@ -19,9 +22,41 @@ fn every_diagnosis() -> Vec<Diagnosis> {
         Diagnosis::ContextUnreadable,
         Diagnosis::NoProjectIdentified,
         Diagnosis::NoConnectionFound {
-            project: PathBuf::from("/Users/b/AI/herdr-db"),
+            project: PathBuf::from(PROJECT),
         },
     ]
+}
+
+#[test]
+fn every_decline_says_something_and_no_two_say_the_same_thing() {
+    // "Distinct" is only worth anything if the user can see the distinction. The prose is
+    // not pinned here — what is pinned is that each fault reads differently, so a message
+    // stubbed out for all of them, or copied from its neighbour, fails.
+    let faults = every_diagnosis();
+    let said: Vec<String> = faults.iter().map(Diagnosis::message).collect();
+    for (fault, message) in faults.iter().zip(&said) {
+        assert!(!message.trim().is_empty(), "{fault:?} explains nothing");
+    }
+    for (i, message) in said.iter().enumerate() {
+        for (j, other) in said.iter().enumerate().skip(i + 1) {
+            assert_ne!(
+                message, other,
+                "{:?} and {:?} read identically, so the Decline is not distinct to the \
+                 person reading it",
+                faults[i], faults[j],
+            );
+        }
+    }
+
+    // The Project is the one thing the user can check for themselves, so the Decline that
+    // has one names it.
+    let about_a_project = said
+        .last()
+        .expect("every_diagnosis ends with the Decline that names a Project");
+    assert!(
+        about_a_project.contains(PROJECT),
+        "a Decline about a Project must name it: {about_a_project}",
+    );
 }
 
 #[test]

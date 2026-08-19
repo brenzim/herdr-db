@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-use crate::context::{InvocationContext, parse};
+use crate::context::{InvocationContext, RawContext};
 use crate::host::Host;
 
 /// The outcome of Connection Resolution.
@@ -42,7 +42,7 @@ pub fn plan(context: &InvocationContext, _host: &dyn Host) -> Plan {
     if raw.trim().is_empty() {
         return Plan::Decline(Diagnosis::ContextEmpty);
     }
-    let Some(parsed) = parse(raw) else {
+    let Some(parsed) = RawContext::parse(raw) else {
         return Plan::Decline(Diagnosis::ContextUnreadable);
     };
     // A context that parsed is a herdr that spoke correctly, whatever it did or did not

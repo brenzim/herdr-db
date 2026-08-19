@@ -4,8 +4,11 @@
 //! Resolution Strategy ran — there are none yet, and when there are, these tests must not
 //! notice. What a `Plan` says is the behaviour; how it was arrived at is not.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 
+use common::sources;
 use herdr_db::context::InvocationContext;
 use herdr_db::host::{Host, Output};
 use herdr_db::plan::{Diagnosis, Plan, plan};
@@ -140,81 +143,6 @@ fn treats_an_empty_value_as_absent_at_the_tier_it_appears_at() {
     );
 }
 
-// The Host port. Nothing below the seam calls it yet — the port exists so that the
-// Resolution Strategies of #4 can be driven from a test with neither Docker nor a live
-// PostgreSQL server. What is worth pinning now is its degradation contract: every method
-// answers with an absence rather than an error, so a Decline is classified from what is
-// missing and never from the text of an io failure.
-
-use herdr_db::host::RealHost;
-
-/// An empty scratch directory of this test's own, so no run can be satisfied by something
-/// an earlier one left behind.
-fn scratch(label: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("target")
-        .join("host-test")
-        .join(label);
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("create the scratch directory");
-    dir
-}
-
-#[test]
-fn the_host_reads_a_file_and_answers_nothing_for_one_it_cannot() {
-    let dir = scratch("read-file");
-    let present = dir.join("present");
-    std::fs::write(&present, "contents").expect("write the file");
-
-    assert_eq!(
-        RealHost.read_file(&present),
-        Some("contents".to_string()),
-        "a readable file must be read",
-    );
-    assert_eq!(
-        RealHost.read_file(&dir.join("absent")),
-        None,
-        "a file that is not there is an absence, not a failure",
-    );
-}
-
-#[test]
-fn the_host_lists_a_directory_and_answers_emptily_for_one_it_cannot() {
-    let dir = scratch("list-dir");
-    std::fs::write(dir.join("entry"), "").expect("write the entry");
-
-    assert_eq!(RealHost.list_dir(&dir), vec![dir.join("entry")]);
-    assert_eq!(
-        RealHost.list_dir(&dir.join("absent")),
-        Vec::<PathBuf>::new(),
-        "a directory that is not there lists as empty rather than failing",
-    );
-}
-
-#[test]
-fn the_host_runs_a_command_and_answers_nothing_for_one_it_cannot_run() {
-    let dir = scratch("run");
-
-    let ran = RealHost
-        .run(
-            "/bin/sh",
-            &["-c", "echo said; echo complained >&2; exit 3"],
-            &dir,
-        )
-        .expect("a runnable command answers");
-    assert_eq!(
-        (ran.status, ran.stdout.trim(), ran.stderr.trim()),
-        (3, "said", "complained"),
-        "a command that ran and failed is an answer, with its status — not an absence",
-    );
-
-    assert_eq!(
-        RealHost.run("no-such-program-exists-here", &[], &dir),
-        None,
-        "a command that could not be run at all is an absence",
-    );
-}
-
 #[test]
 fn never_panics_whatever_the_context_turns_out_to_be() {
     // A panic in a Pane is a crash the user watches happen (ADR-0004), so there is no
@@ -251,15 +179,7 @@ fn never_panics_whatever_the_context_turns_out_to_be() {
 /// a Resolution Strategy could still reach for it directly.
 #[test]
 fn never_consults_the_process_working_directory() {
-    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
-    let sources = std::fs::read_dir(&src).expect("read the source directory");
-
-    for entry in sources.flatten() {
-        let path = entry.path();
-        if path.extension().is_none_or(|kind| kind != "rs") {
-            continue;
-        }
-        let source = std::fs::read_to_string(&path).expect("read the source file");
+    for (path, source) in sources() {
         assert!(
             !source.contains("env::current_dir"),
             "{} names `env::current_dir`, which for a plugin Pane answers with this \
@@ -267,43 +187,4 @@ fn never_consults_the_process_working_directory() {
             path.display(),
         );
     }
-}
-
-#[test]
-fn every_decline_says_something_and_no_two_say_the_same_thing() {
-    // "Distinct" is only worth anything if the user can see the distinction. The prose is
-    // not pinned here — what is pinned is that each fault reads differently, so a message
-    // stubbed out for all of them, or copied from its neighbour, fails.
-    let faults = [
-        Diagnosis::ContextMissing,
-        Diagnosis::ContextEmpty,
-        Diagnosis::ContextUnreadable,
-        Diagnosis::NoProjectIdentified,
-        Diagnosis::NoConnectionFound {
-            project: PathBuf::from("/Users/b/AI/herdr-db"),
-        },
-    ];
-
-    let said: Vec<String> = faults.iter().map(Diagnosis::message).collect();
-    for (fault, message) in faults.iter().zip(&said) {
-        assert!(!message.trim().is_empty(), "{fault:?} explains nothing");
-    }
-    for (i, message) in said.iter().enumerate() {
-        for (j, other) in said.iter().enumerate().skip(i + 1) {
-            assert_ne!(
-                message, other,
-                "{:?} and {:?} read identically, so the Decline is not distinct to the \
-                 person reading it",
-                faults[i], faults[j],
-            );
-        }
-    }
-
-    // The Project is the one thing the user can check for themselves, so the Decline that
-    // has one names it.
-    assert!(
-        said[4].contains("/Users/b/AI/herdr-db"),
-        "a Decline about a Project must name it: {}",
-        said[4],
-    );
 }

@@ -50,32 +50,30 @@ pub(crate) struct RawWorktree {
 }
 
 impl RawContext {
+    /// The payload as a structure, or `None` if it is not JSON at all.
+    pub(crate) fn parse(raw: &str) -> Option<Self> {
+        serde_json::from_str(raw).ok()
+    }
+
     /// The Project this context identifies: the Worktree's repository root, falling back
     /// to the focused Pane's cwd, then the workspace's (ADR-0004). The process working
     /// directory is not a tier and never will be — for a plugin Pane it is the plugin's own
     /// install directory, which would resolve every Project to the plugin itself.
+    ///
+    /// An empty value is a tier that said nothing, not a path: `find` therefore tests the
+    /// tiers one at a time, and a tier that says nothing cannot settle the chain. Filtering
+    /// empties once, after the chain has settled, would root the Project at `/`.
     pub(crate) fn project(&self) -> Option<PathBuf> {
-        // `stated` is applied at every tier rather than once at the end: an empty value is
-        // a tier that said nothing, and the chain has to go on past it. Filtered once at
-        // the end, an empty first tier would settle the chain and resolve to `/`.
-        stated(
+        [
             self.worktree
                 .as_ref()
                 .and_then(|worktree| worktree.repo_root.as_deref()),
-        )
-        .or_else(|| stated(self.focused_pane_cwd.as_deref()))
-        .or_else(|| stated(self.workspace_cwd.as_deref()))
+            self.focused_pane_cwd.as_deref(),
+            self.workspace_cwd.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|path| !path.is_empty())
         .map(PathBuf::from)
     }
-}
-
-/// One tier of the chain, if it actually said something. An empty string is a malformed
-/// host value, not a path — treating it as one roots the Project at the filesystem root.
-fn stated(value: Option<&str>) -> Option<&str> {
-    value.filter(|path| !path.is_empty())
-}
-
-/// The payload as a structure, or `None` if it is not JSON at all.
-pub(crate) fn parse(raw: &str) -> Option<RawContext> {
-    serde_json::from_str(raw).ok()
 }
