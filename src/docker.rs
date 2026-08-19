@@ -1,9 +1,10 @@
 //! The Live Docker Strategy: running containers, matched to the Project by the Compose
 //! working directory they were brought up from.
 //!
-//! Ranked above every declaration-based Strategy because a bound host port is ground truth
-//! — a container Docker reports as running, publishing a port, is a database that is
-//! actually there, where a compose file is only a statement of intent.
+//! The only Strategy there is today, and the one that will rank above every
+//! declaration-based Strategy once #5 adds them: a bound host port is ground truth — a
+//! container Docker reports as running, publishing a port, is a database that is actually
+//! there, where a compose file is only a statement of intent.
 
 use std::path::Path;
 
@@ -31,8 +32,7 @@ pub fn candidates(project: &Path, host: &dyn Host) -> Vec<Candidate> {
         .collect();
     // `docker ps` lists in whichever order it lists, and the rank the title states must not
     // be one of them: only consistent behaviour is learnable, so a Project resolves to the
-    // same Candidate every run. Stated as the two things the order is, rather than derived
-    // from the struct, whose field order is not an opinion about which database to open.
+    // same Candidate every run.
     found.sort_by(|one, other| (one.port, &one.container).cmp(&(other.port, &other.container)));
     found
 }
@@ -57,8 +57,10 @@ fn running(project: &Path, host: &dyn Host) -> Vec<String> {
         .collect()
 }
 
-/// The images that are a PostgreSQL, matched as substrings of what the container was
-/// built from. The false positive this admits is `postgrest/postgrest`, which contains
+/// The images that are a PostgreSQL, matched as substrings of `Config.Image` — the image
+/// reference the container was created from, which for a Compose service with a `build:`
+/// stanza is the locally built `<project>-<service>` tag. The false positive this admits is
+/// `postgrest/postgrest`, which contains
 /// "postgres" and is not a database — it is refused by publishing 3000 rather than 5432,
 /// so tightening this filter would buy nothing and would drop distributions that name
 /// themselves in ways nobody has thought of yet.
@@ -152,9 +154,11 @@ fn name(inspected: &serde_json::Value) -> String {
 /// and only a binding can be put in a DSN. Keyed on `5432/tcp` exactly, because a stack
 /// that also publishes an exporter publishes two ports and only one of them is a database.
 ///
-/// One port per container, always: Docker repeats a binding once per host address it bound
-/// it on, and a database reachable on both IPv4 and IPv6 is one database. The lowest of the
-/// ones that can be reached, since only a reachable binding is one the DSN can name.
+/// One port per container, always: the lowest host port bound to the container's 5432 that
+/// the DSN can reach. Docker repeats a binding once per host address it bound it on, and a
+/// database reachable on both IPv4 and IPv6 is one database — but a container that genuinely
+/// publishes 5432 on two different reachable host ports is resolved to the lower of them
+/// with nothing said about the other.
 fn published_port(inspected: &serde_json::Value) -> Option<u16> {
     inspected
         .get("NetworkSettings")?

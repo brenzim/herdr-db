@@ -12,8 +12,7 @@ use herdr_db::pane::{clear_args, rename_args};
 const PANE_ID: &str = "p-7f3a";
 const TITLE: &str = "orders@5434 · docker · postgres · 1 of 2";
 
-/// The binary's source, for the guards below. Read once: every one of them wants the whole
-/// of it, and a path from `tests/` to `src/` spelled three times breaks three times.
+/// The binary's source, for the guards below.
 const MAIN: &str = include_str!("../src/main.rs");
 
 #[test]
@@ -114,8 +113,7 @@ fn a_pane_that_was_given_no_id_still_launches_the_client() {
 fn takes_the_name_back_off_a_pane_that_never_reached_the_database() {
     // The label herdr writes is durable and outlives the process that asked for it, so a
     // Pane named before a launch that then failed reads for ever as connected to a database
-    // it never opened. Clearing it is the same trap in reverse: `rename <ID> --clear`
-    // parses and `rename --clear <ID>` does not.
+    // it never opened.
     let args = clear_args(PANE_ID);
     assert_eq!(args, vec!["pane", "rename", PANE_ID, "--clear"]);
     assert!(
@@ -145,10 +143,10 @@ fn clears_the_title_only_where_the_client_failed_to_launch() {
     );
 }
 
-/// Renaming the Pane is one of the four things the binary does *above* the seam, alongside
-/// drawing the picker, `exec`ing the Client and holding the diagnosis open. `Host` is what
-/// Connection Resolution may consult; routing the rename through it would put a herdr call
-/// inside the port every Strategy is driven from in tests.
+/// Renaming the Pane is one of the three things the binary does *above* the seam today,
+/// alongside `exec`ing the Client and holding the diagnosis open — the picker joins them at
+/// #10. `Host` is what Connection Resolution may consult; routing the rename through it
+/// would put a herdr call inside the port every Strategy is driven from in tests.
 #[test]
 fn does_not_route_the_rename_through_the_host_port() {
     assert!(

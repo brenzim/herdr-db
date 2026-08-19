@@ -44,8 +44,8 @@ pub fn clear_args(pane_id: &str) -> Vec<String> {
     renaming(pane_id, "--clear")
 }
 
-/// The shape both asks share, so that the ordering they both depend on is stated once: the
-/// id in front, and whatever the label is to become behind it.
+/// The shape both asks share: the id in front, and whatever the label is to become behind
+/// it.
 fn renaming(pane_id: &str, label: &str) -> Vec<String> {
     vec![
         "pane".to_string(),

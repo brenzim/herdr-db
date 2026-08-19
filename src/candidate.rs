@@ -42,9 +42,10 @@ const SCHEME: &str = "postgres";
 const HOST: &str = "127.0.0.1";
 
 /// `value` with everything outside the unreserved set percent-encoded, byte by byte, for
-/// the two places a DSN carries something a person chose: the role and the password. A
-/// password of `p@ss/word` written in as it reads addresses a different host and a
-/// different database, and the Client has no way to know it was handed the wrong one.
+/// the two places this encoding is applied: the role and the password. The database is left
+/// legible in the path instead. A password of `p@ss/word` written in as it reads addresses
+/// a different host and a different database, and the Client has no way to know it was
+/// handed the wrong one.
 fn encoded(value: &str) -> String {
     value
         .bytes()
@@ -62,7 +63,8 @@ fn encoded(value: &str) -> String {
 /// any of the encoding here means anything at all.
 const STRUCTURAL: [char; 4] = ['/', '?', '#', '%'];
 
-/// `value` with only [`STRUCTURAL`] and whitespace percent-encoded, for the database name.
+/// `value` with only [`STRUCTURAL`], whitespace and control characters percent-encoded, for
+/// the database name.
 /// Encoding it the way the role and the password are encoded would be just as safe and
 /// unreadable: the name is what the title states and what the user checks the Client against,
 /// so everything that cannot move the boundary between the DSN's parts stays as written.
@@ -113,8 +115,7 @@ impl Candidate {
         );
         // Only when there was a choice to make, because a Pane that says `1 of 1` invites
         // the user to look for the other one. Always the first, because the Candidates are
-        // ranked and the highest-ranked one is what launched. #10 deletes this along with
-        // the rule that a Project with several Candidates launches without asking.
+        // ranked and the highest-ranked one is what launched.
         if of > 1 {
             title.push_str(&format!(" · 1 of {of}"));
         }
