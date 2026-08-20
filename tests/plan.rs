@@ -1359,10 +1359,10 @@ fn built(working_dir: &'static str, service: &'static str) -> Container {
 
 #[test]
 fn a_rendered_service_with_no_image_resolves_from_the_container_running_it() {
-    // The deferral #4 shipped with: a Compose service built from a local `Dockerfile`
-    // reports its image as `<name>-<service>`, so the Live Docker Strategy misses it
-    // entirely. The render says `warehouse` is a database — it targets 5432 and names
-    // `POSTGRES_*` — and the running container says everything the DSN is made of.
+    // A Compose service built from a local `Dockerfile` reports its image as
+    // `<name>-<service>`, so the Live Docker Strategy misses it entirely. The render says
+    // `warehouse` is a database — it targets 5432 and names `POSTGRES_*` — and the running
+    // container says everything the DSN is made of.
     let host = ComposeHost::stack("/Users/b/AI/orders/infra", MIXED_STACK)
         .running(vec![built("/Users/b/AI/orders/infra", "warehouse")]);
     let launch = launched(&host);
@@ -1823,8 +1823,8 @@ fn a_declared_database_nothing_is_running_names_its_container_service_and_file()
 fn the_named_container_is_the_one_the_renders_own_project_name_would_produce() {
     // `<name>-<service>-1`, where `<name>` is what the render resolved for itself — by which
     // point `COMPOSE_PROJECT_NAME`, a top-level `name:` and the directory default have
-    // already been decided between. the render declares `name: mystack` while sitting in `infra/`,
-    // so a name derived from the directory here sends the user looking for
+    // already been decided between. The render declares `name: mystack` while sitting in
+    // `infra/`, so a name derived from the directory here sends the user looking for
     // `infra-warehouse-1`, which no `docker ps` will ever list.
     let named: Vec<String> = declared_but_stopped(&ComposeHost::stack(INFRA, MIXED_STACK))
         .into_iter()

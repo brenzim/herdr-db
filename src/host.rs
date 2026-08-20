@@ -53,9 +53,9 @@ pub trait Host {
     /// The entries directly inside `path`, or an empty `Vec` if it cannot be listed.
     fn list_dir(&self, path: &Path) -> Vec<PathBuf>;
 
-    /// Runs `program` in `cwd`, or `None` if it could not be run at all *or* did not finish
-    /// in time. A command that ran and failed is `Some`, with its status — that is an
-    /// answer, not an absence.
+    /// Runs `program` in `cwd`, or `None` if it could not be run at all, did not finish in
+    /// time, or was still being read at its deadline. A command that ran and failed is
+    /// `Some`, with its status — that is an answer, not an absence.
     fn run(&self, program: &str, args: &[&str], cwd: &Path) -> Option<Output>;
 
     /// `path` with every symlink resolved, or `None` if it cannot be resolved at all.

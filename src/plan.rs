@@ -60,9 +60,6 @@ pub fn plan(context: &InvocationContext, host: &dyn Host) -> Plan {
     let Some(project) = parsed.project() else {
         return Plan::Decline(Diagnosis::NoProjectIdentified);
     };
-    // One sweep of what is running, read by every Strategy that needs it: two sweeps could
-    // disagree about the same machine, and a Strategy's opinion is only comparable with
-    // another's when both were formed from the same containers.
     let sweep = docker::sweep(&project, host);
     let rendered = compose::candidates(&project, host, &sweep);
     let mut candidates = docker::candidates(&project, host, &sweep);
@@ -93,20 +90,17 @@ pub fn plan(context: &InvocationContext, host: &dyn Host) -> Plan {
 /// one database is one Candidate however many Strategies vouched for it.
 ///
 /// The one place Candidate order is decided. A Strategy hands its Candidates over in
-/// whatever order it read them — `docker ps` lists in whichever order it lists, and a JSON
-/// object iterates in whichever order it iterates — and the rank the title states must not
-/// be either of them: only consistent behaviour is learnable, so a Project resolves to the
-/// same Candidate every run. A Strategy sorting its own list first could only sort it on a
-/// prefix of this key, which is work that cannot change the answer.
+/// whatever order it read them — `docker ps` lists in whichever order it lists — and the
+/// rank the title states must not be that order: only consistent behaviour is learnable, so
+/// a Project resolves to the same Candidate every run. A Strategy sorting its own list first
+/// could only sort it on a prefix of this key, which is work that cannot change the answer.
 ///
 /// Sorted by origin rank *before* the port, because the chain is what the plugin believes
 /// about which answer is most likely right, and a global sort by port would discard it — a
 /// declared database on 5433 is not a better answer than a running one on 5434.
 ///
 /// Deduplicated afterwards, on the container id: sorted first, so "the one that survives" is
-/// "the highest-ranked one" and not "whichever Strategy happened to run first". The id is
-/// exact and already in hand, where the container's name would merge two genuinely different
-/// databases that share one.
+/// "the highest-ranked one" and not "whichever Strategy happened to run first".
 fn ranked(mut candidates: Vec<Candidate>) -> Vec<Candidate> {
     candidates.sort_by(|one, other| {
         (one.origin.rank(), one.port, &one.container).cmp(&(

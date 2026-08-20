@@ -3,8 +3,9 @@
 The Compose Strategy renders a Stack with Compose's own configuration renderer, but never puts a
 rendered port in a DSN. The render says which service is a database and which running container
 belongs to the Stack; the container itself supplies the port, the role, the password and the
-database name. A qualifying service with no running container behind it is a Decline, not a
-Launch.
+database name. A service with no running container behind it is never a Launch; where the
+Stack declares it as a database itself and the Project resolves nothing at all, it is a
+Decline that names it.
 
 ## Why
 

@@ -53,15 +53,19 @@ const POSTGRES_PORT: u64 = 5432;
 /// Strategy has to identify.
 const IDENTIFYING: [&str; 3] = ["POSTGRES_USER", "POSTGRES_DB", "POSTGRES_PASSWORD"];
 
-/// How long the renders of one Project may take between them.
+/// How long a Project may go on starting renders for.
+///
+/// Spent *between* renders and never during one: the check is made before each, so a Stack
+/// that starts just inside the budget still runs to its own `host::DEADLINE` and the worst
+/// case is the budget plus one per-command deadline.
 ///
 /// Each Stack is a `docker compose config` that may take `host::DEADLINE` on its own, and
 /// nothing bounds how many Stacks a Project holds: the Project is not always a repository
 /// root, and with no Worktree and no focused Pane it is herdr's workspace — the directory
 /// every checkout on the machine lives under. Against a half-dead Docker, the state the
 /// per-command deadline exists for, ten Stacks with no shared budget is a Pane drawing
-/// nothing for minutes. Generous against a healthy render, which is a fraction of a second,
-/// so a real monorepo still renders every Stack it has.
+/// nothing for a minute and a half. Generous against a healthy render, which is a fraction
+/// of a second, so a real monorepo still renders every Stack it has.
 const BUDGET: Duration = Duration::from_secs(20);
 
 /// The label naming which service of a Stack a container was brought up as.
@@ -77,8 +81,9 @@ const COMPOSE_NUMBER: &str = "com.docker.compose.container-number";
 #[derive(Debug, Default)]
 pub struct Rendered {
     pub candidates: Vec<Candidate>,
-    /// Every one of them, ordered by Stack directory. Told about one of two, the user
-    /// starts that one, retries, and reads the same screen back naming the other.
+    /// Every one the budget allowed to be rendered, ordered by Stack directory. Told about
+    /// one of two, the user starts that one, retries, and reads the same screen back naming
+    /// the other.
     pub stopped: Vec<Stopped>,
 }
 
@@ -146,9 +151,9 @@ pub fn candidates_within(
         };
         services(&said, &stack, host, sweep, &mut found);
     }
-    // Nothing downstream orders these, and Stacks are walked in a stable order already —
-    // but a Stack can declare several databases, and the order the Decline reads in may not
-    // depend on the order a JSON object happens to iterate in.
+    // Nothing downstream orders these, so the order the Decline reads in is stated here
+    // rather than inherited: a Stack can declare several databases, and neither the walk's
+    // order nor the render's own map type is this list's to depend on.
     found.stopped.sort_by(|one, other| {
         (&one.directory, &one.service).cmp(&(&other.directory, &other.service))
     });
@@ -161,8 +166,7 @@ fn stacks(root: &Path, host: &dyn Host) -> Vec<Stack> {
     let mut found = Vec::new();
     walk(root, 0, host, &mut found);
     for stack in &mut found {
-        // Relative to the Project, once and here rather than per declared database: the
-        // absolute prefix is the part the user already knows.
+        // Once and here, rather than per declared database.
         stack.file = stack
             .file
             .strip_prefix(root)
@@ -296,8 +300,10 @@ fn project_name<'a>(said: &'a serde_json::Value, directory: &'a Path) -> &'a str
 /// The union of three signals rather than the image alone, because a service with a
 /// `build:` stanza renders with no `image` key at all — and that is the case this Strategy
 /// exists for, the one the Live Docker Strategy's image filter cannot see. A false positive
-/// costs nothing: the service still has to have a running container publishing a reachable
-/// host port before it is a Candidate.
+/// costs nothing on the Candidate path: the service still has to have a running container
+/// publishing a reachable host port before it is a Candidate. It is not free on the other
+/// branch of `services`, where a service with no container behind it is named to the user as
+/// a declared database — which is why the Decline asks the stricter `runs_postgres` instead.
 fn qualifies(service: &serde_json::Value) -> bool {
     names_image(service) || targets_postgres(service) || names_postgres(service)
 }

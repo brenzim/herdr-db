@@ -14,9 +14,10 @@ pub enum Origin {
 impl Origin {
     /// The one word the title uses for this origin.
     ///
-    /// `compose` is the rendered read, where Compose itself resolved the Stack. The
-    /// approximate read that follows when the render will not run takes `compose~`, so the
-    /// two are never confusable on screen and neither has to rename the other.
+    /// `compose` is the rendered read, where Compose itself resolved the Stack. `compose~`
+    /// is reserved for the approximate read a later Strategy will offer when the render will
+    /// not run, so the two would never be confusable on screen and neither has to rename the
+    /// other.
     pub fn label(&self) -> &'static str {
         match self {
             Self::Docker => "docker",
@@ -25,12 +26,8 @@ impl Origin {
     }
 
     /// Where this origin sits in the chain, lowest first — the order the Strategies are
-    /// believed in when two of them answer the same Project.
-    ///
-    /// A bound host port is ground truth and a compose file is a statement of intent, so a
-    /// container Docker reports as running outranks the declaration of one however the
-    /// numbers compare: ranking the two by port instead would silently discard the chain,
-    /// which is the plugin's opinion about which answer is most likely the right one.
+    /// believed in when two of them answer the same Project. A container Docker reports as
+    /// running outranks the declaration of one however the numbers compare.
     pub fn rank(&self) -> u8 {
         match self {
             Self::Docker => 0,
