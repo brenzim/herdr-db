@@ -3,7 +3,9 @@
 
 use std::path::PathBuf;
 
+use crate::client;
 use crate::context::{InvocationContext, RawContext};
+use crate::docker;
 use crate::host::Host;
 
 /// The outcome of Connection Resolution.
@@ -33,7 +35,7 @@ pub enum Diagnosis {
 
 /// Turns what herdr said, plus the world, into a Plan. Never panics: every fault is a
 /// `Decline` the Pane can show (ADR-0004).
-pub fn plan(context: &InvocationContext, _host: &dyn Host) -> Plan {
+pub fn plan(context: &InvocationContext, host: &dyn Host) -> Plan {
     let Some(raw) = context.raw() else {
         return Plan::Decline(Diagnosis::ContextMissing);
     };
@@ -48,8 +50,18 @@ pub fn plan(context: &InvocationContext, _host: &dyn Host) -> Plan {
     let Some(project) = parsed.project() else {
         return Plan::Decline(Diagnosis::NoProjectIdentified);
     };
-    // No Resolution Strategy exists yet, so an identified Project has nowhere to look.
-    Plan::Decline(Diagnosis::NoConnectionFound { project })
+    let candidates = docker::candidates(&project, host);
+    let of = candidates.len();
+    // A Strategy that found nothing is not a fault of its own: Docker being absent looks
+    // from here exactly like Docker running nothing, and both leave the chain to go on.
+    let Some(candidate) = candidates.into_iter().next() else {
+        return Plan::Decline(Diagnosis::NoConnectionFound { project });
+    };
+    Plan::Launch(Launch {
+        argv: client::argv(&candidate.dsn()),
+        title: candidate.title(of),
+        read_only: candidate.read_only,
+    })
 }
 
 impl Diagnosis {
