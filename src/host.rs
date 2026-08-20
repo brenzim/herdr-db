@@ -23,6 +23,15 @@ pub const DEADLINE: Duration = Duration::from_secs(10);
 /// `DEADLINE`, so expiry is punctual, and large enough that the wait costs nothing.
 const POLL: Duration = Duration::from_millis(10);
 
+/// How long a reader is given past the deadline once the command has finished.
+///
+/// A command that exits in the last poll window before `DEADLINE` has still succeeded, and
+/// its whole answer is sitting in the pipe — but the pipe closed microseconds ago and the
+/// reader has yet to be rescheduled to see it, so at the deadline itself it is always still
+/// reading. Long enough for that reschedule under load, short enough that a command which
+/// handed its pipe to a child of its own is still given up on rather than waited out.
+const GRACE: Duration = Duration::from_millis(250);
+
 /// What a command said. Held as owned `String`s because a Strategy reads them, and a test
 /// double has to be able to make one up.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -138,16 +147,22 @@ impl RealHost {
     }
 }
 
-/// What a reader thread read, or `None` if it is still reading at `expires`.
+/// What a reader thread read, or `None` if it is still reading at `expires` — or at a
+/// `GRACE` from now, whichever is later.
 ///
 /// The same deadline covers the drain as covers the wait. A pipe reaches EOF when the last
 /// holder of its write end closes it, which is not when the child exits: a command that
 /// hands its stdout to a background process of its own exits at once and leaves the pipe
 /// open behind it. Joining unconditionally there is the hang the deadline exists to
 /// prevent, reached through the branch where the command succeeded.
+///
+/// The grace is what keeps that from also discarding a command that merely finished late:
+/// the wait can only see an exit one poll after it happens, so a healthy command that
+/// answers just inside its deadline arrives here with the deadline already behind it.
 fn drained(reading: std::thread::JoinHandle<String>, expires: Instant) -> Option<String> {
+    let by = expires.max(Instant::now() + GRACE);
     while !reading.is_finished() {
-        if Instant::now() >= expires {
+        if Instant::now() >= by {
             return None;
         }
         std::thread::sleep(POLL);
@@ -168,4 +183,29 @@ fn drain(mut pipe: impl Read + Send + 'static) -> std::thread::JoinHandle<String
         String::from_utf8(said)
             .unwrap_or_else(|said| String::from_utf8_lossy(said.as_bytes()).into_owned())
     })
+}
+
+/// The drain boundary, driven directly. It is in here rather than in `tests/host.rs`
+/// because reaching it through `run_within` would mean timing a real command to exit inside
+/// the last poll window before its deadline, which is a race either way it lands.
+#[cfg(test)]
+mod tests {
+    use super::{Duration, Instant, drained};
+
+    #[test]
+    fn a_reader_still_reading_at_an_expired_deadline_is_given_its_grace() {
+        let reading = std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(20));
+            "said".to_string()
+        });
+
+        assert_eq!(
+            drained(reading, Instant::now()),
+            Some("said".to_string()),
+            "a command that finishes in the last poll window has still succeeded, and its \
+             reader has yet to be rescheduled to see the pipe close: reading a whole \
+             rendered Stack as 'found nothing' because the render took 9.995 seconds is the \
+             Decline the deadline is not there to produce",
+        );
+    }
 }
