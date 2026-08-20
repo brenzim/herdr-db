@@ -1,19 +1,24 @@
 //! The Live Docker Strategy: running containers, matched to the Project by the Compose
 //! working directory they were brought up from.
 //!
-//! The only Strategy there is today, and the one that will rank above every
-//! declaration-based Strategy once #5 adds them: a bound host port is ground truth — a
-//! container Docker reports as running, publishing a port, is a database that is actually
-//! there, where a compose file is only a statement of intent.
+//! The Strategy that ranks above every declaration-based one: a bound host port is ground
+//! truth — a container Docker reports as running, publishing a port, is a database that is
+//! actually there, where a compose file is only a statement of intent.
+//!
+//! What a sweep is and what a container offers are read from here by the Compose Strategy
+//! too, so that two Strategies vouching for one container cannot disagree about it
+//! (ADR-0008). Matching a container to a Project is this Strategy's alone.
 
 use std::path::Path;
 
 use crate::candidate::{Candidate, Origin};
 use crate::host::Host;
 
-/// The command this Strategy asks about the machine's containers, and the one binary it
-/// needs present. Absent, it is a Strategy that finds nothing rather than a fault.
-const PROGRAM: &str = "docker";
+/// The one binary either Strategy needs present — this one asks it about the machine's
+/// containers, and the Compose Strategy renders with it. Absent, it is a Strategy that
+/// finds nothing rather than a fault. Spelled once, so the two can never drift apart about
+/// which binary they shell out to.
+pub(crate) const PROGRAM: &str = "docker";
 
 /// One running container: the id `docker ps` listed it under, and the object
 /// `docker inspect` answered with.
@@ -34,18 +39,27 @@ pub fn sweep(project: &Path, host: &dyn Host) -> Vec<Inspected> {
             if inspected.status != 0 {
                 return None;
             }
-            let said: serde_json::Value = serde_json::from_str(&inspected.stdout).ok()?;
             // `docker inspect` answers with an array of one; unwrapped here so that every
-            // reader of a sweep sees a container rather than a list holding one.
+            // reader of a sweep sees a container rather than a list holding one. Moved out
+            // of the array rather than cloned out of it: an inspect object is a tree of
+            // tens of kilobytes, and copying all of it to drop a one-element wrapper is
+            // hundreds of allocations per container that are garbage immediately.
+            let serde_json::Value::Array(said) = serde_json::from_str(&inspected.stdout).ok()?
+            else {
+                return None;
+            };
             Some(Inspected {
                 id: id.clone(),
-                json: said.get(0)?.clone(),
+                json: said.into_iter().next()?,
             })
         })
         .collect()
 }
 
-/// The Candidates the running containers of this machine offer `project`.
+/// The Candidates the running containers of this machine offer `project`, in whatever order
+/// `docker ps` listed them. Ordering them is the chain's business and not a Strategy's:
+/// `plan::ranked` sorts every Strategy's Candidates together, on a key this one's own sort
+/// could only be a prefix of.
 pub fn candidates(project: &Path, host: &dyn Host, sweep: &[Inspected]) -> Vec<Candidate> {
     // Once, before anything is compared: the Project arrives as herdr names it, and the
     // labels arrive as Compose recorded them, and on macOS the same directory is `/var/…`
@@ -53,15 +67,10 @@ pub fn candidates(project: &Path, host: &dyn Host, sweep: &[Inspected]) -> Vec<C
     let Some(project_root) = host.canonicalize(project) else {
         return Vec::new();
     };
-    let mut found: Vec<Candidate> = sweep
+    sweep
         .iter()
         .filter_map(|inspected| candidate(inspected, &project_root, host))
-        .collect();
-    // `docker ps` lists in whichever order it lists, and the rank the title states must not
-    // be one of them: only consistent behaviour is learnable, so a Project resolves to the
-    // same Candidate every run.
-    found.sort_by(|one, other| (one.port, &one.container).cmp(&(other.port, &other.container)));
-    found
+        .collect()
 }
 
 /// The ids of every container Docker reports as running. Liveness is asked of Docker and

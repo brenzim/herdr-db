@@ -14,12 +14,8 @@
 use std::path::{Path, PathBuf};
 
 use crate::candidate::{Candidate, Origin};
-use crate::docker::{self, Inspected};
+use crate::docker::{self, Inspected, PROGRAM};
 use crate::host::Host;
-
-/// The command this Strategy renders with, and the one binary it needs present. Absent, it
-/// is a Strategy that finds nothing rather than a fault.
-const PROGRAM: &str = "docker";
 
 /// The render, asked for the way `docker compose up` in that directory would have resolved
 /// the Stack: no `-f`, so Compose applies its own filename precedence and loads its own
@@ -94,13 +90,18 @@ pub struct Stopped {
     pub directory: PathBuf,
 }
 
-/// One Stack: a directory, and the single file Compose would load in it.
+/// One Stack: a directory, absolute, and the single file Compose would load in it, held
+/// relative to the Project because displaying it is the only thing it is for.
 struct Stack {
     directory: PathBuf,
     file: PathBuf,
 }
 
 /// What the Stacks beneath `project` offer, given the containers already swept.
+///
+/// The Candidates arrive in whatever order the Stacks and their services were read in:
+/// ordering them is the chain's business and not a Strategy's, and `plan::ranked` sorts
+/// every Strategy's together on a key this one's own sort could only be a prefix of.
 pub fn candidates(project: &Path, host: &dyn Host, sweep: &[Inspected]) -> Rendered {
     // Once, before anything is compared: every Stack directory is then built by descending
     // from a canonical root, and the Compose labels are canonicalised to meet them.
@@ -112,14 +113,11 @@ pub fn candidates(project: &Path, host: &dyn Host, sweep: &[Inspected]) -> Rende
         let Some(said) = render(&stack.directory, host) else {
             continue;
         };
-        services(&said, &stack, &project_root, host, sweep, &mut found);
+        services(&said, &stack, host, sweep, &mut found);
     }
-    // Stacks are walked in a stable order already, but a Stack can declare several
-    // databases and neither the rank the title states nor the order the Decline reads in
-    // may depend on the order a JSON object happens to iterate in.
-    found
-        .candidates
-        .sort_by(|one, other| (one.port, &one.container).cmp(&(other.port, &other.container)));
+    // Nothing downstream orders these, and Stacks are walked in a stable order already —
+    // but a Stack can declare several databases, and the order the Decline reads in may not
+    // depend on the order a JSON object happens to iterate in.
     found.stopped.sort_by(|one, other| {
         (&one.directory, &one.service).cmp(&(&other.directory, &other.service))
     });
@@ -131,6 +129,15 @@ pub fn candidates(project: &Path, host: &dyn Host, sweep: &[Inspected]) -> Rende
 fn stacks(root: &Path, host: &dyn Host) -> Vec<Stack> {
     let mut found = Vec::new();
     walk(root, 0, host, &mut found);
+    for stack in &mut found {
+        // Relative to the Project, once and here rather than per declared database: the
+        // absolute prefix is the part the user already knows.
+        stack.file = stack
+            .file
+            .strip_prefix(root)
+            .unwrap_or(&stack.file)
+            .to_path_buf();
+    }
     found.sort_by(|one, other| one.directory.cmp(&other.directory));
     found
 }
@@ -205,7 +212,6 @@ fn render(directory: &Path, host: &dyn Host) -> Option<serde_json::Value> {
 fn services(
     said: &serde_json::Value,
     stack: &Stack,
-    project_root: &Path,
     host: &dyn Host,
     sweep: &[Inspected],
     found: &mut Rendered,
@@ -213,6 +219,8 @@ fn services(
     let Some(services) = said.get("services").and_then(|it| it.as_object()) else {
         return;
     };
+    // Once per Stack: it is the render's answer about the Stack, not about any one service.
+    let project = project_name(said, &stack.directory);
     for (service, declared) in services {
         if !qualifies(declared) {
             continue;
@@ -222,28 +230,24 @@ fn services(
                 .candidates
                 .extend(docker::connection(inspected, Origin::Compose)),
             None => found.stopped.push(Stopped {
-                container: container_name(said, &stack.directory, service),
+                container: format!("{project}-{service}-1"),
                 service: service.clone(),
-                file: stack
-                    .file
-                    .strip_prefix(project_root)
-                    .unwrap_or(&stack.file)
-                    .to_path_buf(),
+                file: stack.file.clone(),
                 directory: stack.directory.clone(),
             }),
         }
     }
 }
 
-/// The container Compose would have brought `service` up as.
+/// The project name Compose would prefix the Stack's container names with, which is what
+/// makes one `<name>-<service>-1`.
 ///
-/// `<name>` is read back out of the render rather than derived, because by the time Compose
-/// writes it there it has already resolved `COMPOSE_PROJECT_NAME` over a top-level `name:`
-/// over the directory the Stack sits in. The fallback is that same directory — Compose's own
+/// Read back out of the render rather than derived, because by the time Compose writes it
+/// there it has already resolved `COMPOSE_PROJECT_NAME` over a top-level `name:` over the
+/// directory the Stack sits in. The fallback is that same directory — Compose's own
 /// default, and reachable only from a render that named no project at all.
-fn container_name(said: &serde_json::Value, directory: &Path, service: &str) -> String {
-    let project = said
-        .get("name")
+fn project_name<'a>(said: &'a serde_json::Value, directory: &'a Path) -> &'a str {
+    said.get("name")
         .and_then(|it| it.as_str())
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| {
@@ -251,8 +255,7 @@ fn container_name(said: &serde_json::Value, directory: &Path, service: &str) -> 
                 .file_name()
                 .and_then(|name| name.to_str())
                 .unwrap_or_default()
-        });
-    format!("{project}-{service}-1")
+        })
 }
 
 /// Whether a rendered service is a PostgreSQL.
@@ -263,11 +266,17 @@ fn container_name(said: &serde_json::Value, directory: &Path, service: &str) -> 
 /// costs nothing: the service still has to have a running container publishing a reachable
 /// host port before it is a Candidate.
 fn qualifies(service: &serde_json::Value) -> bool {
-    let image = service
+    names_image(service) || targets_postgres(service) || names_postgres(service)
+}
+
+/// Whether the service declares an image that is a PostgreSQL, matched the way the Live
+/// Docker Strategy matches a running container's — the same list, so a Stack and the
+/// container it brought up cannot disagree about what a PostgreSQL image is.
+fn names_image(service: &serde_json::Value) -> bool {
+    service
         .get("image")
         .and_then(|it| it.as_str())
-        .is_some_and(|image| docker::IMAGES.iter().any(|known| image.contains(known)));
-    image || targets_postgres(service) || names_postgres(service)
+        .is_some_and(|image| docker::IMAGES.iter().any(|known| image.contains(known)))
 }
 
 /// Whether the service declares a port whose *container* side is PostgreSQL's. The host side
@@ -327,30 +336,35 @@ fn brought_up_by(
     service: &str,
     host: &dyn Host,
 ) -> bool {
-    let Some(labels) = inspected.get("Config").and_then(|it| it.get("Labels")) else {
+    let Some(labels) = labels(inspected) else {
         return false;
     };
-    let named = labels
-        .get(COMPOSE_SERVICE)
-        .and_then(|it| it.as_str())
-        .is_some_and(|named| named == service);
+    // The service first, and the directory only if it matched: reading the label is free
+    // where resolving the directory is a `realpath` of every one of its components, asked
+    // once per container for every service of every Stack.
+    if labels.get(COMPOSE_SERVICE).and_then(|it| it.as_str()) != Some(service) {
+        return false;
+    }
     // Both sides canonical, as they are for the Project: macOS reports the same directory as
     // `/var/…` and as `/private/var/…`, and compared as they arrive it fails to equal itself.
-    let same_directory = labels
+    labels
         .get(docker::COMPOSE_WORKING_DIR)
         .and_then(|it| it.as_str())
         .and_then(|working_dir| host.canonicalize(Path::new(working_dir)))
-        .is_some_and(|working_dir| working_dir == directory);
-    named && same_directory
+        .is_some_and(|working_dir| working_dir == directory)
+}
+
+/// The label map a container carries, or `None` when it carries none — which is the shape
+/// `docker inspect` reports and not one this crate chose.
+fn labels(inspected: &serde_json::Value) -> Option<&serde_json::Value> {
+    inspected.get("Config").and_then(|it| it.get("Labels"))
 }
 
 /// Which replica of its service a container is. Parsed, because Compose stores the number as
 /// a string; a container that does not carry one sorts last rather than stopping being a
 /// container.
 fn number(inspected: &serde_json::Value) -> u64 {
-    inspected
-        .get("Config")
-        .and_then(|it| it.get("Labels"))
+    labels(inspected)
         .and_then(|labels| labels.get(COMPOSE_NUMBER))
         .and_then(|it| it.as_str())
         .and_then(|number| number.parse().ok())

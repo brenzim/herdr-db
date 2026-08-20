@@ -143,6 +143,12 @@ fn drain(mut pipe: impl Read + Send + 'static) -> std::thread::JoinHandle<String
     std::thread::spawn(move || {
         let mut said = Vec::new();
         let _ = pipe.read_to_end(&mut said);
-        String::from_utf8_lossy(&said).into_owned()
+        // The buffer is reused where it can be: a rendered Compose Stack is the hundreds of
+        // kilobytes the drain above exists for, and `from_utf8_lossy` on valid UTF-8 borrows
+        // it only for `into_owned` to allocate and copy the whole thing a second time. A
+        // command that answers in something other than UTF-8 still degrades rather than
+        // fails, which is the whole rule this Host is written to.
+        String::from_utf8(said)
+            .unwrap_or_else(|said| String::from_utf8_lossy(said.as_bytes()).into_owned())
     })
 }

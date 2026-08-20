@@ -261,6 +261,51 @@ impl Container {
     }
 }
 
+/// A path prefix, and what it resolves to — or `None` for a prefix that resolves to nothing
+/// at all, which is a directory this machine does not have.
+type Links = Vec<(&'static str, Option<&'static str>)>;
+
+/// `path` with `links` applied: the resolution both doubles answer `canonicalize` with.
+///
+/// Paths canonicalise to themselves unless `links` says otherwise, because most of them
+/// have no symlink in them and a test that had to spell out every path's canonical form
+/// would say less about the one that does.
+fn linked(links: &Links, path: &Path) -> Option<PathBuf> {
+    let raw = path.to_str()?;
+    let Some((from, to)) = links
+        .iter()
+        .find(|(from, _)| raw == *from || raw.starts_with(&format!("{from}/")))
+    else {
+        return Some(path.to_path_buf());
+    };
+    to.map(|to| PathBuf::from(raw.replacen(from, to, 1)))
+}
+
+/// What a working `docker` says to the two calls a Strategy makes of it about containers.
+///
+/// One definition for both doubles, because the argv here is the argv a Strategy has to
+/// send: written twice, a Strategy that changed how it asks Docker would keep matching one
+/// double while the other answered "nothing running" — which every test reads as a
+/// legitimate `found_nothing()` rather than as a double that has gone stale.
+fn docker_says(containers: &[Container], args: &[&str]) -> Option<Output> {
+    let said = match args {
+        ["ps", "--filter", "status=running", "--format", "{{.ID}}"] => containers
+            .iter()
+            .map(|container| format!("{}\n", container.id))
+            .collect(),
+        ["inspect", id] => containers.iter().find(|it| it.id == *id)?.inspected(),
+        // Any other call is one this double was never told to expect, and answering it
+        // with something plausible would hide the Strategy having changed its mind about
+        // how it asks Docker.
+        _ => return None,
+    };
+    Some(Output {
+        status: 0,
+        stdout: said,
+        stderr: String::new(),
+    })
+}
+
 /// What the `docker` command does when a Strategy runs it.
 enum Docker {
     /// Not installed: the command cannot be run at all.
@@ -274,14 +319,10 @@ enum Docker {
     Saying(String),
 }
 
-/// A Host that answers `docker` and nothing else. Paths canonicalise to themselves unless
-/// `links` says otherwise, because most of them have no symlink in them and a test that
-/// had to spell out every path's canonical form would say less about the one that does.
+/// A Host that answers `docker` and nothing else.
 struct DockerHost {
     docker: Docker,
-    /// A path prefix, and what it resolves to — or `None` for a prefix that resolves to
-    /// nothing at all, which is a directory this machine does not have.
-    links: Vec<(&'static str, Option<&'static str>)>,
+    links: Links,
 }
 
 impl DockerHost {
@@ -340,34 +381,11 @@ impl Host for DockerHost {
                 });
             }
         };
-        let said = match args {
-            ["ps", "--filter", "status=running", "--format", "{{.ID}}"] => containers
-                .iter()
-                .map(|container| format!("{}\n", container.id))
-                .collect(),
-            ["inspect", id] => containers.iter().find(|it| it.id == *id)?.inspected(),
-            // Any other call is one this double was never told to expect, and answering it
-            // with something plausible would hide the Strategy having changed its mind
-            // about how it asks Docker.
-            _ => return None,
-        };
-        Some(Output {
-            status: 0,
-            stdout: said,
-            stderr: String::new(),
-        })
+        docker_says(containers, args)
     }
 
     fn canonicalize(&self, path: &Path) -> Option<PathBuf> {
-        let raw = path.to_str()?;
-        let Some((from, to)) = self
-            .links
-            .iter()
-            .find(|(from, _)| raw == *from || raw.starts_with(&format!("{from}/")))
-        else {
-            return Some(path.to_path_buf());
-        };
-        to.map(|to| PathBuf::from(raw.replacen(from, to, 1)))
+        linked(&self.links, path)
     }
 }
 
@@ -1013,11 +1031,11 @@ fn two_candidates_on_one_port_are_ordered_by_the_container_name() {
 // value. No test here runs Docker (AC 16).
 // ---------------------------------------------------------------------------------------
 
-/// fx1 — an `!override` on the ports, and a `build:` service with no `image`. The base file
+/// An `!override` on the ports, and a `build:` service with no `image`. The base file
 /// declares `db` on `5432:5432`; `docker-compose.override.yml` declares
 /// `ports: !override ["5434:5432"]`, and Compose has already merged the two down to the
 /// single `5434` entry below.
-const FX1: &str = r#"{
+const OVERRIDDEN_PORT: &str = r#"{
   "name": "fx1",
   "networks": { "default": { "name": "fx1_default", "ipam": {} } },
   "services": {
@@ -1041,13 +1059,13 @@ const FX1: &str = r#"{
   }
 }"#;
 
-/// fx2 — the case this Strategy exists for. `warehouse` is `build:`-only, so it renders with
+/// The case this Strategy exists for. `warehouse` is `build:`-only, so it renders with
 /// no `image` key and the Live Docker Strategy cannot see it; it qualifies on its 5432
 /// target and its `POSTGRES_*` keys alone. `analytics` is behind a profile and is only here
 /// because the render asked for every profile. `cache` qualifies on nothing. The
 /// `POSTGRES_PASSWORD` came out of `env_file: [db.env]` and is an identification signal and
 /// never a credential (ADR-0008).
-const FX2: &str = r#"{
+const MIXED_STACK: &str = r#"{
   "name": "mystack",
   "services": {
     "analytics": {
@@ -1085,9 +1103,9 @@ const FX2: &str = r#"{
   }
 }"#;
 
-/// fx5 — a port exposed but never published: the entry carries no `published` key at all.
+/// A port exposed but never published: the entry carries no `published` key at all.
 /// Still a database by its 5432 target.
-const FX5: &str = r#"{
+const EXPOSED_NOT_PUBLISHED: &str = r#"{
   "name": "fx5",
   "services": {
     "db": {
@@ -1098,10 +1116,10 @@ const FX5: &str = r#"{
   }
 }"#;
 
-/// fx7 — an interpolated variable that is not set. Compose renders the key with an empty
+/// An interpolated variable that is not set. Compose renders the key with an empty
 /// value, which the image reads as unset and this Strategy reads as "this is a database".
 /// Nothing else here says PostgreSQL: no image, and no port at all.
-const FX7: &str = r#"{
+const EMPTY_INTERPOLATION: &str = r#"{
   "name": "fx7",
   "services": {
     "db": {
@@ -1166,7 +1184,7 @@ struct ComposeHost {
     /// A Stack's directory, and what rendering it says.
     renders: Vec<(String, Render)>,
     containers: Vec<Container>,
-    links: Vec<(&'static str, Option<&'static str>)>,
+    links: Links,
     /// The directories `docker compose config` was actually run in, in order, so that a
     /// test can assert on the rendering that did *not* happen.
     rendered_in: RefCell<Vec<PathBuf>>,
@@ -1250,20 +1268,6 @@ impl Host for ComposeHost {
             return None;
         }
         match args {
-            ["ps", "--filter", "status=running", "--format", "{{.ID}}"] => Some(Output {
-                status: 0,
-                stdout: self
-                    .containers
-                    .iter()
-                    .map(|container| format!("{}\n", container.id))
-                    .collect(),
-                stderr: String::new(),
-            }),
-            ["inspect", id] => Some(Output {
-                status: 0,
-                stdout: self.containers.iter().find(|it| it.id == *id)?.inspected(),
-                stderr: String::new(),
-            }),
             // The render, exactly as the Strategy must ask for it: in the Stack's own
             // directory, with every profile, and with no `-f` — a second `-f` would merge a
             // file Compose itself would not have loaded.
@@ -1287,22 +1291,14 @@ impl Host for ComposeHost {
                     Render::Absent => return None,
                 })
             }
-            // Anything else is a call this double was never told to expect, and answering it
-            // plausibly would hide the Strategy having changed its mind about how it asks.
-            _ => None,
+            // The container calls, and the refusal of anything else, are what every scripted
+            // Docker answers alike.
+            _ => docker_says(&self.containers, args),
         }
     }
 
     fn canonicalize(&self, path: &Path) -> Option<PathBuf> {
-        let raw = path.to_str()?;
-        let Some((from, to)) = self
-            .links
-            .iter()
-            .find(|(from, _)| raw == *from || raw.starts_with(&format!("{from}/")))
-        else {
-            return Some(path.to_path_buf());
-        };
-        to.map(|to| PathBuf::from(raw.replacen(from, to, 1)))
+        linked(&self.links, path)
     }
 }
 
@@ -1328,7 +1324,7 @@ fn a_rendered_service_with_no_image_resolves_from_the_container_running_it() {
     // reports its image as `<name>-<service>`, so the Live Docker Strategy misses it
     // entirely. The render says `warehouse` is a database — it targets 5432 and names
     // `POSTGRES_*` — and the running container says everything the DSN is made of.
-    let host = ComposeHost::stack("/Users/b/AI/orders/infra", FX2)
+    let host = ComposeHost::stack("/Users/b/AI/orders/infra", MIXED_STACK)
         .running(vec![built("/Users/b/AI/orders/infra", "warehouse")]);
     let launch = launched(&host);
     assert_eq!(launch.argv[1], "postgres://app@127.0.0.1:5432/warehouse");
@@ -1338,7 +1334,7 @@ fn a_rendered_service_with_no_image_resolves_from_the_container_running_it() {
 /// A Project whose only Stack sits in `directory`, with the container running its
 /// `warehouse` service. What every discovery test varies is where that directory is.
 fn stack_at(directory: &'static str) -> ComposeHost {
-    ComposeHost::stack(directory, FX2).running(vec![built(directory, "warehouse")])
+    ComposeHost::stack(directory, MIXED_STACK).running(vec![built(directory, "warehouse")])
 }
 
 #[test]
@@ -1418,7 +1414,7 @@ fn a_directory_holding_more_than_one_compose_filename_is_one_stack() {
     // Compose applies its own precedence between the four names and merges nothing, so a
     // directory holding two of them still resolves to one render. Taken as a Stack per
     // filename it renders up to four times, and the same database arrives as `1 of 4`.
-    let host = ComposeHost::stack("/Users/b/AI/orders/infra", FX2)
+    let host = ComposeHost::stack("/Users/b/AI/orders/infra", MIXED_STACK)
         .holding("/Users/b/AI/orders/infra/compose.yml")
         .holding("/Users/b/AI/orders/infra/docker-compose.yaml")
         .holding("/Users/b/AI/orders/infra/docker-compose.yml")
@@ -1441,7 +1437,7 @@ fn the_render_supplies_the_identity_and_the_running_container_supplies_the_dsn()
     // `env_file:`, which is what makes it look like a credential. None of it may reach the
     // DSN: a declared port connects to nothing when nothing is running it, and to something
     // else when something is.
-    let host = ComposeHost::stack(INFRA, FX2).running(vec![Container {
+    let host = ComposeHost::stack(INFRA, MIXED_STACK).running(vec![Container {
         ports: published(&["5544"]),
         env: vec!["POSTGRES_USER=live", "POSTGRES_DB=orders"],
         ..built(INFRA, "warehouse")
@@ -1460,7 +1456,7 @@ fn an_override_that_changes_the_published_port_resolves_to_what_the_container_pu
     // and the application config in the same Stack still says 5432. Compose did that merge
     // — nothing here parsed a `!override` — and the container is what settles the number
     // either way, so the stale application config is never a port anything can reach.
-    let host = ComposeHost::stack(INFRA, FX1).running(vec![Container {
+    let host = ComposeHost::stack(INFRA, OVERRIDDEN_PORT).running(vec![Container {
         service: Some("db"),
         number: Some("1"),
         ports: published(&["5434"]),
@@ -1483,7 +1479,7 @@ fn a_service_qualifies_on_its_image_or_its_declared_port_or_a_postgres_key() {
         // Stack that interpolates its credentials from the environment is precisely the
         // kind that has to be identified. The key being named is the signal; reading the
         // *value* the way a container's environment is read would drop the case.
-        ("an empty POSTGRES_USER", FX7),
+        ("an empty POSTGRES_USER", EMPTY_INTERPOLATION),
     ] {
         let host = ComposeHost::stack(INFRA, render).running(vec![built(INFRA, "db")]);
         assert!(
@@ -1501,7 +1497,7 @@ fn a_qualifying_service_with_nothing_running_it_is_not_a_candidate() {
     // instead is asserted where that Decline is.
     assert!(
         !matches!(
-            planned_against(&ComposeHost::stack(INFRA, FX2)),
+            planned_against(&ComposeHost::stack(INFRA, MIXED_STACK)),
             Plan::Launch(_)
         ),
         "a Stack with nothing running it produced a Candidate anyway",
@@ -1526,7 +1522,7 @@ fn a_port_declared_without_a_binding_still_identifies_the_service() {
     // `ports: ["5432"]` renders with no `published` key at all. The container side is what
     // says "this is a PostgreSQL", and it is the only side of a declared port that is ever
     // read — so a Stack that publishes nothing still resolves from whatever is running it.
-    let host = ComposeHost::stack(INFRA, FX5).running(vec![built(INFRA, "db")]);
+    let host = ComposeHost::stack(INFRA, EXPOSED_NOT_PUBLISHED).running(vec![built(INFRA, "db")]);
     assert_eq!(launched(&host).title, "warehouse@5432 · compose · app");
 }
 
@@ -1541,7 +1537,7 @@ fn a_container_belongs_to_a_stack_only_when_it_names_that_stacks_own_directory_a
         "/Users/b/AI/orders/infra/nested",
         "/Users/b/AI/orders/apps/api",
     ] {
-        let host = ComposeHost::stack(INFRA, FX2).running(vec![Container {
+        let host = ComposeHost::stack(INFRA, MIXED_STACK).running(vec![Container {
             working_dir: Some(working_dir),
             ..built(INFRA, "warehouse")
         }]);
@@ -1554,7 +1550,7 @@ fn a_container_belongs_to_a_stack_only_when_it_names_that_stacks_own_directory_a
     // And the service is half of it: one Stack's `api` container is in the same directory
     // as its `warehouse` one and is not the database.
     for service in [Some("api"), None] {
-        let host = ComposeHost::stack(INFRA, FX2).running(vec![Container {
+        let host = ComposeHost::stack(INFRA, MIXED_STACK).running(vec![Container {
             service,
             ..built(INFRA, "warehouse")
         }]);
@@ -1571,7 +1567,7 @@ fn both_sides_of_the_stack_directory_are_canonicalised_before_they_are_compared(
     // the two arrives depends on who said it: herdr names the Worktree, Compose names the
     // directory it was run from. Canonicalising one side only makes the directory fail to
     // equal itself, and every Stack in the Project stops resolving.
-    let host = ComposeHost::stack("/private/var/AI/orders/infra", FX2)
+    let host = ComposeHost::stack("/private/var/AI/orders/infra", MIXED_STACK)
         .running(vec![built("/var/AI/orders/infra", "warehouse")])
         .linking("/var", Some("/private/var"));
     assert!(
@@ -1586,7 +1582,7 @@ fn the_lowest_numbered_container_of_a_scaled_service_is_the_one_resolved() {
     // identical labels, and only one of them may be resolved: whichever Docker happened to
     // list first differs run to run, and only consistent behaviour is learnable. The number
     // is a string in the label map, so read as text the tenth replica precedes the second.
-    let host = ComposeHost::stack(INFRA, FX2).running(vec![
+    let host = ComposeHost::stack(INFRA, MIXED_STACK).running(vec![
         Container {
             id: "w10",
             name: "/mystack-warehouse-10",
@@ -1609,7 +1605,7 @@ fn the_lowest_numbered_container_of_a_scaled_service_is_the_one_resolved() {
     // A container carrying no number at all sorts last rather than disqualifying itself:
     // it is still a container running the service, and something is better resolved than
     // nothing.
-    let host = ComposeHost::stack(INFRA, FX2).running(vec![
+    let host = ComposeHost::stack(INFRA, MIXED_STACK).running(vec![
         Container {
             id: "wx",
             name: "/mystack-warehouse-x",
@@ -1635,7 +1631,7 @@ fn a_service_publishing_two_host_ports_for_5432_is_one_candidate_on_the_lowest()
     // The same rule the Live Docker Strategy applies, applied by the same code: two
     // Strategies that read one container differently produce two Candidates that no
     // deduplication can then reconcile. One database, one Candidate, on the lower port.
-    let host = ComposeHost::stack(INFRA, FX2).running(vec![Container {
+    let host = ComposeHost::stack(INFRA, MIXED_STACK).running(vec![Container {
         ports: published(&["15432", "5432"]),
         ..built(INFRA, "warehouse")
     }]);
@@ -1647,7 +1643,7 @@ fn a_stack_that_will_not_render_is_silent_and_does_not_stop_the_others() {
     // An unset `${VAR:?}` in one Stack is not the Project failing to resolve. Compose exits
     // 1 with an empty stdout and its reason on stderr — an answer, not an absence — and a
     // `?` that propagated out of the loop would abandon every other Stack in the Project.
-    let host = ComposeHost::stack(INFRA, FX2)
+    let host = ComposeHost::stack(INFRA, MIXED_STACK)
         .holding("/Users/b/AI/orders/broken/compose.yaml")
         .rendering("/Users/b/AI/orders/broken", Render::Refuses)
         .running(vec![built(INFRA, "warehouse")]);
@@ -1730,12 +1726,12 @@ fn a_declared_database_nothing_is_running_names_its_container_service_and_file()
     // Pane that says nothing they can act on. What they can act on is exactly this: the
     // container Compose would have brought up, which service it is, and which file said so
     // — named relative to the Project, since the absolute prefix is the part they know.
-    let host = ComposeHost::stack(INFRA, FX1);
+    let host = ComposeHost::stack(INFRA, OVERRIDDEN_PORT);
     let stopped = declared_but_stopped(&host);
     assert_eq!(
         stopped.len(),
         1,
-        "the one database fx1 declares was not named once: {stopped:?}",
+        "the one database the render declares was not named once: {stopped:?}",
     );
     assert_eq!(stopped[0].container, "fx1-db-1");
     assert_eq!(stopped[0].service, "db");
@@ -1754,10 +1750,10 @@ fn a_declared_database_nothing_is_running_names_its_container_service_and_file()
 fn the_named_container_is_the_one_the_renders_own_project_name_would_produce() {
     // `<name>-<service>-1`, where `<name>` is what the render resolved for itself — by which
     // point `COMPOSE_PROJECT_NAME`, a top-level `name:` and the directory default have
-    // already been decided between. fx2 declares `name: mystack` while sitting in `infra/`,
+    // already been decided between. the render declares `name: mystack` while sitting in `infra/`,
     // so a name derived from the directory here sends the user looking for
     // `infra-warehouse-1`, which no `docker ps` will ever list.
-    let named: Vec<String> = declared_but_stopped(&ComposeHost::stack(INFRA, FX2))
+    let named: Vec<String> = declared_but_stopped(&ComposeHost::stack(INFRA, MIXED_STACK))
         .into_iter()
         .map(|it| it.container)
         .collect();
@@ -1774,7 +1770,7 @@ fn every_stopped_database_in_the_project_is_named_ordered_by_stack_directory() {
     // `r`, and gets the same screen back naming another. And the order has to be the
     // Project's rather than the walk's — a diagnosis that reads differently on each retry
     // is one the user cannot tell apart from a Project that changed underneath them.
-    let host = ComposeHost::stack(INFRA, FX2).and_stack(APPS, FX1);
+    let host = ComposeHost::stack(INFRA, MIXED_STACK).and_stack(APPS, OVERRIDDEN_PORT);
     let named: Vec<String> = declared_but_stopped(&host)
         .into_iter()
         .map(|it| it.container)
@@ -1791,8 +1787,8 @@ fn a_project_with_one_stack_running_and_another_stopped_launches_from_the_runnin
     // down. Somewhere to work beats a diagnosis about somewhere else, so the Stack that is
     // up opens and the one that is down is not mentioned — surfacing it alongside the
     // Launch is #10's job, where it can be an unselectable entry in the picker.
-    let host = ComposeHost::stack(INFRA, FX2)
-        .and_stack(APPS, FX1)
+    let host = ComposeHost::stack(INFRA, MIXED_STACK)
+        .and_stack(APPS, OVERRIDDEN_PORT)
         .running(vec![built(INFRA, "warehouse")]);
     assert_eq!(launched(&host).title, "warehouse@5432 · compose · app");
 }
@@ -1802,7 +1798,7 @@ fn the_remedy_starts_the_named_service_from_the_stacks_own_directory() {
     // Naming the service is load-bearing twice over: it is what makes the line about one
     // database, and it is what activates the profile of a service behind `profiles:` —
     // `analytics` is one, and a bare `docker compose up -d` would not start it.
-    let said = declined(&ComposeHost::stack(INFRA, FX2)).message();
+    let said = declined(&ComposeHost::stack(INFRA, MIXED_STACK)).message();
     for remedy in [
         "docker compose up -d analytics",
         "docker compose up -d warehouse",
@@ -1839,13 +1835,14 @@ fn the_file_the_decline_names_is_the_one_compose_itself_would_load() {
     // or, worse, edits it and watches the database keep coming up the old way.
     let host = ComposeHost::empty()
         .holding("/Users/b/AI/orders/infra/docker-compose.yml")
-        .rendering(INFRA, Render::Says(FX1));
+        .rendering(INFRA, Render::Says(OVERRIDDEN_PORT));
     assert_eq!(
         declared_but_stopped(&host)[0].file,
         PathBuf::from("infra/docker-compose.yml"),
     );
 
-    let host = ComposeHost::stack(INFRA, FX1).holding("/Users/b/AI/orders/infra/compose.yml");
+    let host =
+        ComposeHost::stack(INFRA, OVERRIDDEN_PORT).holding("/Users/b/AI/orders/infra/compose.yml");
     assert_eq!(
         declared_but_stopped(&host)[0].file,
         PathBuf::from("infra/compose.yaml"),
@@ -1875,11 +1872,11 @@ fn shared(port: &str) -> Container {
 
 #[test]
 fn a_running_container_beats_the_port_its_compose_file_declares() {
-    // fx1 declares `db` on 5434 and the container that is running it publishes 5439 —
+    // The render declares `db` on 5434 and the container that is running it publishes 5439 —
     // somebody edited the file after bringing the Stack up, or brought it up with a `-p`
     // of their own. What is running is what can be connected to, so the container's port
     // wins and the declared one is never put in a DSN (ADR-0008).
-    let host = ComposeHost::stack(INFRA, FX1).running(vec![shared("5439")]);
+    let host = ComposeHost::stack(INFRA, OVERRIDDEN_PORT).running(vec![shared("5439")]);
     let launch = launched(&host);
     assert_eq!(launch.argv[1], "postgres://app@127.0.0.1:5439/appdb");
 
@@ -1901,8 +1898,8 @@ fn two_databases_that_share_a_container_name_are_two_candidates() {
     // on the name, one of two genuinely different databases silently stops existing — and
     // the one that survives is whichever Strategy happened to be asked first.
     let elsewhere = "/Users/b/AI/orders/apps";
-    let host = ComposeHost::stack(INFRA, FX2)
-        .and_stack(elsewhere, FX2)
+    let host = ComposeHost::stack(INFRA, MIXED_STACK)
+        .and_stack(elsewhere, MIXED_STACK)
         .running(vec![
             Container {
                 id: "one",
@@ -1935,7 +1932,7 @@ fn a_declared_database_never_outranks_a_running_one_on_a_higher_port() {
     // so the lower port does not win — sorting the two by port alone would silently discard
     // the chain, which is the plugin's whole opinion about which answer is most likely the
     // right one.
-    let host = ComposeHost::stack(INFRA, FX2).running(vec![
+    let host = ComposeHost::stack(INFRA, MIXED_STACK).running(vec![
         Container {
             ports: published(&["5433"]),
             ..built(INFRA, "warehouse")

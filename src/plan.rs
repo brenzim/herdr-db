@@ -92,6 +92,13 @@ pub fn plan(context: &InvocationContext, host: &dyn Host) -> Plan {
 /// Every Strategy's Candidates as one list: ordered by the chain, then deduplicated so that
 /// one database is one Candidate however many Strategies vouched for it.
 ///
+/// The one place Candidate order is decided. A Strategy hands its Candidates over in
+/// whatever order it read them — `docker ps` lists in whichever order it lists, and a JSON
+/// object iterates in whichever order it iterates — and the rank the title states must not
+/// be either of them: only consistent behaviour is learnable, so a Project resolves to the
+/// same Candidate every run. A Strategy sorting its own list first could only sort it on a
+/// prefix of this key, which is work that cannot change the answer.
+///
 /// Sorted by origin rank *before* the port, because the chain is what the plugin believes
 /// about which answer is most likely right, and a global sort by port would discard it — a
 /// declared database on 5433 is not a better answer than a running one on 5434.
