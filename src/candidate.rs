@@ -23,12 +23,31 @@ impl Origin {
             Self::Compose => "compose",
         }
     }
+
+    /// Where this origin sits in the chain, lowest first — the order the Strategies are
+    /// believed in when two of them answer the same Project.
+    ///
+    /// A bound host port is ground truth and a compose file is a statement of intent, so a
+    /// container Docker reports as running outranks the declaration of one however the
+    /// numbers compare: ranking the two by port instead would silently discard the chain,
+    /// which is the plugin's opinion about which answer is most likely the right one.
+    pub fn rank(&self) -> u8 {
+        match self {
+            Self::Docker => 0,
+            Self::Compose => 1,
+        }
+    }
 }
 
 /// One proposed connection, with everything the Launch is rendered from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Candidate {
     pub origin: Origin,
+    /// The id Docker listed the container under, and the one thing two Strategies vouching
+    /// for the same database always agree on exactly. What Candidates are deduplicated on:
+    /// the name would merge two genuinely different databases that share one, and the port
+    /// would merge a database with itself across origins and two Stacks with each other.
+    pub id: String,
     pub database: String,
     pub role: String,
     pub password: Option<String>,

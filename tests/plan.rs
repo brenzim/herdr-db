@@ -1690,6 +1690,103 @@ fn never_panics_whatever_compose_says() {
     }
 }
 
+// ---------------------------------------------------------------------------------------
+// Reality beats declaration: the two Strategies, answering one Project together.
+// ---------------------------------------------------------------------------------------
+
+/// A container an official image is running, brought up by the Stack in `INFRA` as its `db`
+/// service — so *both* Strategies can see it: the Live Docker Strategy by its image and the
+/// Project it sits under, and the Compose Strategy by the labels naming the Stack.
+fn shared(port: &str) -> Container {
+    Container {
+        id: "d0",
+        name: "/fx1-db-1",
+        image: "postgres:16",
+        working_dir: Some(INFRA),
+        service: Some("db"),
+        number: Some("1"),
+        ports: published(&[port]),
+        env: vec!["POSTGRES_USER=app", "POSTGRES_DB=appdb"],
+    }
+}
+
+#[test]
+fn a_running_container_beats_the_port_its_compose_file_declares() {
+    // fx1 declares `db` on 5434 and the container that is running it publishes 5439 —
+    // somebody edited the file after bringing the Stack up, or brought it up with a `-p`
+    // of their own. What is running is what can be connected to, so the container's port
+    // wins and the declared one is never put in a DSN (ADR-0008).
+    let host = ComposeHost::stack(INFRA, FX1).running(vec![shared("5439")]);
+    let launch = launched(&host);
+    assert_eq!(launch.argv[1], "postgres://app@127.0.0.1:5439/appdb");
+
+    // And one database is one Candidate, whatever number of Strategies vouched for it: a
+    // title reading `1 of 2` here invites the user to go looking for a second database that
+    // does not exist. Deduplicated on the container id, the higher-ranked origin surviving,
+    // so the title names Docker.
+    assert_eq!(
+        launch.title, "appdb@5439 · docker · app",
+        "one container vouched for by both Strategies was not deduplicated",
+    );
+}
+
+#[test]
+fn two_databases_that_share_a_container_name_are_two_candidates() {
+    // Deduplication is on the container id and not on the name, because the name is not
+    // Docker's to keep unique across Compose projects: two Stacks in one Project, each with
+    // a service Compose numbers `-1`, and each `docker compose -p` named the same. Merged
+    // on the name, one of two genuinely different databases silently stops existing — and
+    // the one that survives is whichever Strategy happened to be asked first.
+    let elsewhere = "/Users/b/AI/orders/apps";
+    let host = ComposeHost::stack(INFRA, FX2)
+        .and_stack(elsewhere, FX2)
+        .running(vec![
+            Container {
+                id: "one",
+                name: "/stack-warehouse-1",
+                ports: published(&["5433"]),
+                env: vec!["POSTGRES_USER=app", "POSTGRES_DB=first"],
+                ..built(INFRA, "warehouse")
+            },
+            Container {
+                id: "two",
+                name: "/stack-warehouse-1",
+                ports: published(&["5434"]),
+                env: vec!["POSTGRES_USER=app", "POSTGRES_DB=second"],
+                ..built(elsewhere, "warehouse")
+            },
+        ]);
+    let launch = launched(&host);
+    assert_eq!(
+        launch.title, "first@5433 · compose · app · 1 of 2",
+        "two databases sharing a container name were merged into one",
+    );
+    assert_eq!(launch.argv[1], "postgres://app@127.0.0.1:5433/first");
+}
+
+#[test]
+fn a_declared_database_never_outranks_a_running_one_on_a_higher_port() {
+    // Two different databases, one from each Strategy: a hand-run `postgres` container on
+    // 5434 that no Stack claims, and a Stack's `build:` service on 5433 that only the
+    // render can see. The combined list is ordered by the chain first and the port second,
+    // so the lower port does not win — sorting the two by port alone would silently discard
+    // the chain, which is the plugin's whole opinion about which answer is most likely the
+    // right one.
+    let host = ComposeHost::stack(INFRA, FX2).running(vec![
+        Container {
+            ports: published(&["5433"]),
+            ..built(INFRA, "warehouse")
+        },
+        container(),
+    ]);
+    let launch = launched(&host);
+    assert_eq!(
+        launch.title, "orders@5434 · docker · app · 1 of 2",
+        "a declared database on the lower port outranked a running one",
+    );
+    assert_eq!(launch.argv[1], "postgres://app@127.0.0.1:5434/orders");
+}
+
 /// A verified trap, not a style preference (ADR-0004).
 ///
 /// `plan()`'s signature already makes the mistake unreachable: neither the invocation

@@ -217,15 +217,14 @@ fn container<'a>(
     directory: &Path,
     service: &str,
     host: &dyn Host,
-) -> Option<&'a serde_json::Value> {
+) -> Option<&'a Inspected> {
     sweep
         .iter()
-        .map(|inspected| &inspected.json)
-        .filter(|inspected| brought_up_by(inspected, directory, service, host))
+        .filter(|inspected| brought_up_by(&inspected.json, directory, service, host))
         // Scaled, the service has several containers and only one of them may be resolved:
         // whichever Docker happened to list first would differ run to run, and only
         // consistent behaviour is learnable.
-        .min_by_key(|inspected| number(inspected))
+        .min_by_key(|inspected| number(&inspected.json))
 }
 
 fn brought_up_by(

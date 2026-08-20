@@ -55,7 +55,7 @@ pub fn candidates(project: &Path, host: &dyn Host, sweep: &[Inspected]) -> Vec<C
     };
     let mut found: Vec<Candidate> = sweep
         .iter()
-        .filter_map(|inspected| candidate(&inspected.json, &project_root, host))
+        .filter_map(|inspected| candidate(inspected, &project_root, host))
         .collect();
     // `docker ps` lists in whichever order it lists, and the rank the title states must not
     // be one of them: only consistent behaviour is learnable, so a Project resolves to the
@@ -104,12 +104,8 @@ const DEFAULT_ROLE: &str = "postgres";
 
 /// One container's `docker inspect` object as a Candidate, or `None` if it is not one of
 /// `project`'s: the wrong image, the wrong directory, or no reachable port.
-fn candidate(
-    inspected: &serde_json::Value,
-    project_root: &Path,
-    host: &dyn Host,
-) -> Option<Candidate> {
-    let config = inspected.get("Config")?;
+fn candidate(inspected: &Inspected, project_root: &Path, host: &dyn Host) -> Option<Candidate> {
+    let config = inspected.json.get("Config")?;
     let image = config.get("Image")?.as_str()?;
     if !IMAGES.iter().any(|known| image.contains(known)) {
         return None;
@@ -134,8 +130,8 @@ fn candidate(
 /// Shared rather than written twice: both Strategies can vouch for the same container, and
 /// two readings of one container that disagreed about its port or its role would produce two
 /// Candidates that no deduplication could then reconcile (ADR-0008).
-pub(crate) fn connection(inspected: &serde_json::Value, origin: Origin) -> Option<Candidate> {
-    let config = inspected.get("Config")?;
+pub(crate) fn connection(inspected: &Inspected, origin: Origin) -> Option<Candidate> {
+    let config = inspected.json.get("Config")?;
     // The image's own defaults, because they are what the container that is running did:
     // an unset `POSTGRES_USER` started it as `postgres`, and an unset `POSTGRES_DB` gave it
     // a database named after whichever role that resolved to. An unset `POSTGRES_PASSWORD`
@@ -144,11 +140,15 @@ pub(crate) fn connection(inspected: &serde_json::Value, origin: Origin) -> Optio
     let role = setting(config, "POSTGRES_USER").unwrap_or(DEFAULT_ROLE);
     Some(Candidate {
         origin,
+        // Carried forward from the `ps` listing rather than read back out of the inspect
+        // object: it is the same string for both Strategies because they read one sweep,
+        // where `Id` is Docker's own to report in the short form or the long one.
+        id: inspected.id.clone(),
         database: setting(config, "POSTGRES_DB").unwrap_or(role).to_string(),
         role: role.to_string(),
         password: setting(config, "POSTGRES_PASSWORD").map(str::to_string),
-        port: published_port(inspected)?,
-        container: name(inspected),
+        port: published_port(&inspected.json)?,
+        container: name(&inspected.json),
         read_only: false,
     })
 }

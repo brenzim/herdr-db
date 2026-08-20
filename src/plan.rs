@@ -1,8 +1,10 @@
 //! The seam. `plan()` is the one boundary the plugin is tested at: given what herdr said
 //! and a view of the world, it either launches the Client or declines readably.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 
+use crate::candidate::Candidate;
 use crate::client;
 use crate::compose;
 use crate::context::{InvocationContext, RawContext};
@@ -57,6 +59,7 @@ pub fn plan(context: &InvocationContext, host: &dyn Host) -> Plan {
     let sweep = docker::sweep(&project, host);
     let mut candidates = docker::candidates(&project, host, &sweep);
     candidates.extend(compose::candidates(&project, host, &sweep));
+    let candidates = ranked(candidates);
     let of = candidates.len();
     // A Strategy that found nothing is not a fault of its own: Docker being absent looks
     // from here exactly like Docker running nothing, and both leave the chain to go on.
@@ -68,6 +71,30 @@ pub fn plan(context: &InvocationContext, host: &dyn Host) -> Plan {
         title: candidate.title(of),
         read_only: candidate.read_only,
     })
+}
+
+/// Every Strategy's Candidates as one list: ordered by the chain, then deduplicated so that
+/// one database is one Candidate however many Strategies vouched for it.
+///
+/// Sorted by origin rank *before* the port, because the chain is what the plugin believes
+/// about which answer is most likely right, and a global sort by port would discard it — a
+/// declared database on 5433 is not a better answer than a running one on 5434.
+///
+/// Deduplicated afterwards, on the container id: sorted first, so "the one that survives" is
+/// "the highest-ranked one" and not "whichever Strategy happened to run first". The id is
+/// exact and already in hand, where the container's name would merge two genuinely different
+/// databases that share one.
+fn ranked(mut candidates: Vec<Candidate>) -> Vec<Candidate> {
+    candidates.sort_by(|one, other| {
+        (one.origin.rank(), one.port, &one.container).cmp(&(
+            other.origin.rank(),
+            other.port,
+            &other.container,
+        ))
+    });
+    let mut seen = HashSet::new();
+    candidates.retain(|candidate| seen.insert(candidate.id.clone()));
+    candidates
 }
 
 impl Diagnosis {
