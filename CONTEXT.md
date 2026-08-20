@@ -19,6 +19,11 @@ The specific checkout herdr was invoked from. It identifies the Project but does
 itself, distinguish one database from another.
 _Avoid_: checkout, working copy, branch
 
+**Stack**:
+A directory inside a Project holding a Compose file, taken with whatever Compose itself
+loads beside it. A Project may contain several, and each is rendered on its own.
+_Avoid_: compose project, service, deployment
+
 **Invocation Context**:
 What herdr states about where it was invoked from when it opens the Pane — the Worktree's
 repository root, the focused Pane's cwd, the workspace's. The only statement about the
