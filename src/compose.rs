@@ -12,6 +12,7 @@
 //! either nothing is listening on or that the container already disagrees with.
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use crate::candidate::{Candidate, Origin};
 use crate::docker::{self, Inspected, PROGRAM};
@@ -51,6 +52,17 @@ const POSTGRES_PORT: u64 = 5432;
 /// that interpolates its credentials from the environment is exactly the kind this
 /// Strategy has to identify.
 const IDENTIFYING: [&str; 3] = ["POSTGRES_USER", "POSTGRES_DB", "POSTGRES_PASSWORD"];
+
+/// How long the renders of one Project may take between them.
+///
+/// Each Stack is a `docker compose config` that may take `host::DEADLINE` on its own, and
+/// nothing bounds how many Stacks a Project holds: the Project is not always a repository
+/// root, and with no Worktree and no focused Pane it is herdr's workspace — the directory
+/// every checkout on the machine lives under. Against a half-dead Docker, the state the
+/// per-command deadline exists for, ten Stacks with no shared budget is a Pane drawing
+/// nothing for minutes. Generous against a healthy render, which is a fraction of a second,
+/// so a real monorepo still renders every Stack it has.
+const BUDGET: Duration = Duration::from_secs(20);
 
 /// The label naming which service of a Stack a container was brought up as.
 const COMPOSE_SERVICE: &str = "com.docker.compose.service";
@@ -103,13 +115,32 @@ struct Stack {
 /// ordering them is the chain's business and not a Strategy's, and `plan::ranked` sorts
 /// every Strategy's together on a key this one's own sort could only be a prefix of.
 pub fn candidates(project: &Path, host: &dyn Host, sweep: &[Inspected]) -> Rendered {
+    candidates_within(project, host, sweep, BUDGET)
+}
+
+/// [`candidates`] under the budget given rather than `BUDGET`. Exists so that a test can
+/// prove the budget ends the loop in milliseconds instead of paying it in wall clock; the
+/// Pane always goes through `candidates`.
+pub fn candidates_within(
+    project: &Path,
+    host: &dyn Host,
+    sweep: &[Inspected],
+    budget: Duration,
+) -> Rendered {
     // Once, before anything is compared: every Stack directory is then built by descending
     // from a canonical root, and the Compose labels are canonicalised to meet them.
     let Some(project_root) = host.canonicalize(project) else {
         return Rendered::default();
     };
+    let expires = Instant::now() + budget;
     let mut found = Rendered::default();
     for stack in stacks(&project_root, host) {
+        // A Stack the budget stops from being rendered says nothing, exactly as one that
+        // refused to render says nothing: whatever the Stacks already read said still
+        // stands, and the rest of the chain still runs.
+        if Instant::now() >= expires {
+            break;
+        }
         let Some(said) = render(&stack.directory, host) else {
             continue;
         };
@@ -203,7 +234,8 @@ fn render(directory: &Path, host: &dyn Host) -> Option<serde_json::Value> {
 }
 
 /// What a rendered Stack offers, appended to `found`: a Candidate for every qualifying
-/// service something is running, and a `Stopped` for every one nothing is.
+/// service something is running, and a `Stopped` for every service that runs a PostgreSQL
+/// itself and has nothing running it.
 ///
 /// The two are exclusive and neither is a fallback for the other. A service whose container
 /// is running but publishes nothing reachable is neither: it is not a connection, and
@@ -229,12 +261,13 @@ fn services(
             Some(inspected) => found
                 .candidates
                 .extend(docker::connection(inspected, Origin::Compose)),
-            None => found.stopped.push(Stopped {
+            None if runs_postgres(declared) => found.stopped.push(Stopped {
                 container: format!("{project}-{service}-1"),
                 service: service.clone(),
                 file: stack.file.clone(),
                 directory: stack.directory.clone(),
             }),
+            None => {}
         }
     }
 }
@@ -267,6 +300,20 @@ fn project_name<'a>(said: &'a serde_json::Value, directory: &'a Path) -> &'a str
 /// host port before it is a Candidate.
 fn qualifies(service: &serde_json::Value) -> bool {
     names_image(service) || targets_postgres(service) || names_postgres(service)
+}
+
+/// Whether a qualifying service is the PostgreSQL itself, rather than something the Stack
+/// hands its credentials to. The stricter question, and the one the Decline has to ask.
+///
+/// `POSTGRES_USER` and its two companions are as much the mark of the app that connects to
+/// the database as of the database: the ordinary layout puts all three in the `api` service
+/// as well. On the Candidate path that costs nothing, because the app publishes no
+/// `5432/tcp` and yields no Candidate. Here it would name `<project>-api-1` as a declared
+/// database and offer a remedy that starts the app, changes nothing, and brings back the
+/// same screen on retry — so the environment alone is not enough, and either the image or a
+/// port targeting 5432 has to say so.
+fn runs_postgres(service: &serde_json::Value) -> bool {
+    names_image(service) || targets_postgres(service)
 }
 
 /// Whether the service declares an image that is a PostgreSQL, matched the way the Live

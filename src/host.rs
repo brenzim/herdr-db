@@ -132,10 +132,27 @@ impl RealHost {
             // A command killed by a signal reports no code; -1 says "it did not finish"
             // without anyone having to look at signal numbers.
             status: status.code().unwrap_or(-1),
-            stdout: said.join().ok()?,
-            stderr: complained.join().ok()?,
+            stdout: drained(said, expires)?,
+            stderr: drained(complained, expires)?,
         })
     }
+}
+
+/// What a reader thread read, or `None` if it is still reading at `expires`.
+///
+/// The same deadline covers the drain as covers the wait. A pipe reaches EOF when the last
+/// holder of its write end closes it, which is not when the child exits: a command that
+/// hands its stdout to a background process of its own exits at once and leaves the pipe
+/// open behind it. Joining unconditionally there is the hang the deadline exists to
+/// prevent, reached through the branch where the command succeeded.
+fn drained(reading: std::thread::JoinHandle<String>, expires: Instant) -> Option<String> {
+    while !reading.is_finished() {
+        if Instant::now() >= expires {
+            return None;
+        }
+        std::thread::sleep(POLL);
+    }
+    reading.join().ok()
 }
 
 /// Reads one of a command's pipes to its end on a thread of its own.

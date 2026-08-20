@@ -8,9 +8,10 @@ mod common;
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use common::sources;
-use herdr_db::compose::Stopped;
+use herdr_db::compose::{Stopped, candidates_within};
 use herdr_db::context::InvocationContext;
 use herdr_db::host::{Host, Output};
 use herdr_db::plan::{Diagnosis, Launch, Plan, plan};
@@ -1148,6 +1149,32 @@ const TARGET_ONLY: &str = r#"{
   }
 }"#;
 
+/// The ordinary layout, where the application is handed the database's credentials: `api`
+/// names all three `POSTGRES_*` keys — Compose resolved them out of the same `.env` the
+/// database reads — because it connects to `db`, not because it is one.
+const CREDENTIALS_HANDED_ON: &str = r#"{
+  "name": "fx11",
+  "services": {
+    "api": {
+      "build": { "context": "/Users/b/AI/orders/infra", "dockerfile": "Dockerfile" },
+      "command": null,
+      "entrypoint": null,
+      "environment": { "POSTGRES_DB": "appdb", "POSTGRES_PASSWORD": "s", "POSTGRES_USER": "app" },
+      "networks": { "default": null }
+    },
+    "db": {
+      "command": null,
+      "entrypoint": null,
+      "environment": { "POSTGRES_DB": "appdb", "POSTGRES_USER": "app" },
+      "image": "postgres:16",
+      "networks": { "default": null },
+      "ports": [
+        { "mode": "ingress", "target": 5432, "published": "5432", "protocol": "tcp" }
+      ]
+    }
+  }
+}"#;
+
 /// A Stack whose only service is a Redis. Nothing about it says PostgreSQL, so nothing may
 /// resolve from it however alive its container is.
 const CACHE_ONLY: &str = r#"{
@@ -1185,6 +1212,9 @@ struct ComposeHost {
     renders: Vec<(String, Render)>,
     containers: Vec<Container>,
     links: Links,
+    /// How long each render takes. Zero everywhere but the budget test, which is about the
+    /// wall clock and has nothing else to spend.
+    render_takes: Duration,
     /// The directories `docker compose config` was actually run in, in order, so that a
     /// test can assert on the rendering that did *not* happen.
     rendered_in: RefCell<Vec<PathBuf>>,
@@ -1198,6 +1228,7 @@ impl ComposeHost {
             renders: Vec::new(),
             containers: Vec::new(),
             links: Vec::new(),
+            render_takes: Duration::ZERO,
             rendered_in: RefCell::new(Vec::new()),
         }
     }
@@ -1227,6 +1258,13 @@ impl ComposeHost {
 
     fn running(mut self, containers: Vec<Container>) -> Self {
         self.containers = containers;
+        self
+    }
+
+    /// A Docker slow enough to be worth a budget: the half-dead Docker Desktop that answers
+    /// by not answering, in miniature.
+    fn rendering_slowly(mut self, takes: Duration) -> Self {
+        self.render_takes = takes;
         self
     }
 
@@ -1273,6 +1311,7 @@ impl Host for ComposeHost {
             // file Compose itself would not have loaded.
             ["compose", "--profile", "*", "config", "--format", "json"] => {
                 self.rendered_in.borrow_mut().push(cwd.to_path_buf());
+                std::thread::sleep(self.render_takes);
                 let (_, render) = self
                     .renders
                     .iter()
@@ -1664,6 +1703,40 @@ fn a_stack_that_will_not_render_is_silent_and_does_not_stop_the_others() {
     }
 }
 
+/// Short enough that proving the budget costs the suite no real time. The budget the Pane
+/// runs under is the Strategy's own; what is under test here is that it ends the loop at
+/// all, which is the same code at either length.
+const TEST_BUDGET: Duration = Duration::from_millis(200);
+
+#[test]
+fn the_renders_of_one_project_share_a_budget() {
+    // The one test in this file that reaches past `plan()`, because what it is about is the
+    // wall clock and the Pane's own budget is twenty seconds of it. A Project is not always
+    // a repository root — with no Worktree and no focused Pane it is herdr's workspace, the
+    // directory every checkout on the machine lives under — and every Stack beneath it is a
+    // render a half-dead Docker can hold for the whole per-command deadline. Nothing bounds
+    // how many Stacks are found, so with no budget between them the Pane draws nothing for
+    // minutes.
+    let mut host = ComposeHost::empty().rendering_slowly(Duration::from_millis(150));
+    for stack in ["a", "b", "c", "d", "e", "f"] {
+        host = host.and_stack(&format!("{PROJECT}/{stack}"), MIXED_STACK);
+    }
+
+    let rendered = candidates_within(Path::new(PROJECT), &host, &[], TEST_BUDGET);
+
+    let asked = host.rendered_in.borrow().len();
+    assert!(
+        (1..6).contains(&asked),
+        "six Stacks at 150ms a render were rendered {asked} times under a 200ms budget",
+    );
+    // And a Stack the budget stopped short of is silent, exactly as one that refused to
+    // render is: what the Stacks already read said still stands.
+    assert!(
+        !rendered.stopped.is_empty(),
+        "the budget threw away what the renders it did run had already found",
+    );
+}
+
 #[test]
 fn never_panics_whatever_compose_says() {
     // The render is another program's output, versioned by that program. A panic in a Pane
@@ -1782,6 +1855,28 @@ fn every_stopped_database_in_the_project_is_named_ordered_by_stack_directory() {
 }
 
 #[test]
+fn a_service_merely_handed_the_credentials_is_not_a_declared_database() {
+    // `POSTGRES_USER` and its companions identify a database well enough to be worth a look
+    // at the containers, and not well enough to name one: the ordinary layout hands all
+    // three to the `api` service as well. Named here, the Decline calls the application a
+    // database, tells the user to run `docker compose up -d api`, and brings the same
+    // screen back on the retry — because starting the app changes nothing.
+    let stopped = declared_but_stopped(&ComposeHost::stack(INFRA, CREDENTIALS_HANDED_ON));
+    let named: Vec<String> = stopped.iter().map(|it| it.container.clone()).collect();
+    assert_eq!(named, ["fx11-db-1"]);
+
+    let said = Diagnosis::DeclaredButNotRunning { stopped }.message();
+    assert!(
+        said.contains("declares a database that is not running"),
+        "one declared database was counted as two: {said}",
+    );
+    assert!(
+        !said.contains("up -d api"),
+        "the Decline offers a remedy that starts the application: {said}",
+    );
+}
+
+#[test]
 fn a_project_with_one_stack_running_and_another_stopped_launches_from_the_running_one() {
     // This Decline is about a Project that resolved nothing, not about a database that is
     // down. Somewhere to work beats a diagnosis about somewhere else, so the Stack that is
@@ -1825,6 +1920,24 @@ fn the_remedy_starts_the_named_service_from_the_stacks_own_directory() {
     assert!(
         !said.contains("start-db"),
         "the Decline names an action that does not exist yet: {said}",
+    );
+}
+
+#[test]
+fn the_remedy_survives_a_stack_directory_a_shell_would_split() {
+    // The remedy is written to be pasted, and plenty of Projects live under a directory
+    // with a space in its name. Unquoted, `cd /Users/b/My Projects/orders/infra` is a `cd`
+    // with two arguments: the shell either refuses it or lands somewhere else entirely, and
+    // the `docker compose up -d` after the `&&` then runs there.
+    let project = "/Users/b/My Projects/orders";
+    let host = ComposeHost::stack(&format!("{project}/infra"), OVERRIDDEN_PORT);
+    let Plan::Decline(diagnosis) = planned_for(project, &host) else {
+        panic!("the Project resolved rather than naming its stopped database");
+    };
+    let said = diagnosis.message();
+    assert!(
+        said.contains("cd '/Users/b/My Projects/orders/infra' && docker compose up -d db"),
+        "the remedy does not survive being pasted into a shell: {said}",
     );
 }
 

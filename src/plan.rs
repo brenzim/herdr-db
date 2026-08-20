@@ -2,7 +2,7 @@
 //! and a view of the world, it either launches the Client or declines readably.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::candidate::Candidate;
 use crate::client;
@@ -139,11 +139,20 @@ fn listed(stopped: &[Stopped]) -> String {
                 it.container,
                 it.service,
                 it.file.display(),
-                it.directory.display(),
+                quoted(&it.directory),
                 it.service,
             )
         })
         .collect()
+}
+
+/// A path as a shell reads it back as one word. The remedy is written to be pasted, and a
+/// Project at `/Users/b/My Projects/orders` otherwise offers a `cd` with two arguments —
+/// which either fails or quietly lands somewhere else, and the `docker compose up` after
+/// the `&&` then runs there. Single quotes, because they are the one quoting a shell does
+/// not look inside; a single quote in the path closes them, escapes itself and reopens.
+fn quoted(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', r"'\''"))
 }
 
 impl Diagnosis {

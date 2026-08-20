@@ -124,6 +124,35 @@ fn the_host_gives_up_on_a_command_that_never_finishes() {
 }
 
 #[test]
+fn the_host_gives_up_on_a_command_whose_pipes_outlive_it() {
+    let dir = scratch("run-drain-deadline");
+
+    let started = Instant::now();
+    // The command exits at once, having handed its stdout to a background process of its
+    // own. A pipe reaches EOF when the last holder of its write end closes it, not when the
+    // child exits, so a wait that joins its readers unconditionally hangs here — the same
+    // hang the deadline exists to prevent, reached through the branch that succeeded.
+    let gave_up = RealHost.run_within(
+        "/bin/sh",
+        &["-c", "sleep 5 & echo said"],
+        &dir,
+        TEST_DEADLINE,
+    );
+    let waited = started.elapsed();
+
+    assert_eq!(
+        gave_up, None,
+        "a command still being read at its deadline is an absence, the same as one still \
+         running at it",
+    );
+    assert!(
+        waited < Duration::from_secs(2),
+        "the deadline has to end the drain rather than the pipe closing doing it: waited \
+         {waited:?} for a command whose stdout is held open for five seconds",
+    );
+}
+
+#[test]
 fn the_host_hears_out_a_command_that_says_more_than_a_pipe_will_hold() {
     let dir = scratch("run-loud");
     let spoken = 512 * 1024;
