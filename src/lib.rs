@@ -4,6 +4,7 @@
 
 pub mod candidate;
 pub mod client;
+pub mod compose;
 pub mod context;
 pub mod diagnosis;
 pub mod docker;

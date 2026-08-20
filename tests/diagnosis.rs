@@ -5,6 +5,7 @@
 
 use std::path::PathBuf;
 
+use herdr_db::compose::Stopped;
 use herdr_db::diagnosis::{QUIT_KEY, RETRY_KEY, Turn, diagnosis_screen, on_input};
 use herdr_db::plan::Diagnosis;
 
@@ -19,6 +20,14 @@ fn every_diagnosis() -> Vec<Diagnosis> {
         Diagnosis::ContextEmpty,
         Diagnosis::ContextUnreadable,
         Diagnosis::NoProjectIdentified,
+        Diagnosis::DeclaredButNotRunning {
+            stopped: vec![Stopped {
+                container: "mystack-warehouse-1".to_string(),
+                service: "warehouse".to_string(),
+                file: PathBuf::from("infra/compose.yaml"),
+                directory: PathBuf::from("/Users/b/AI/herdr-db/infra"),
+            }],
+        },
         Diagnosis::NoConnectionFound {
             project: PathBuf::from(PROJECT),
         },

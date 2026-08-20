@@ -8,13 +8,30 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Origin {
     Docker,
+    Compose,
 }
 
 impl Origin {
     /// The one word the title uses for this origin.
+    ///
+    /// `compose` is the rendered read, where Compose itself resolved the Stack. `compose~`
+    /// is reserved for the approximate read a later Strategy will offer when the render will
+    /// not run, so the two would never be confusable on screen and neither has to rename the
+    /// other.
     pub fn label(&self) -> &'static str {
         match self {
             Self::Docker => "docker",
+            Self::Compose => "compose",
+        }
+    }
+
+    /// Where this origin sits in the chain, lowest first — the order the Strategies are
+    /// believed in when two of them answer the same Project. A container Docker reports as
+    /// running outranks the declaration of one however the numbers compare.
+    pub fn rank(&self) -> u8 {
+        match self {
+            Self::Docker => 0,
+            Self::Compose => 1,
         }
     }
 }
@@ -23,6 +40,11 @@ impl Origin {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Candidate {
     pub origin: Origin,
+    /// The id Docker listed the container under, and the one thing two Strategies vouching
+    /// for the same database always agree on exactly. What Candidates are deduplicated on:
+    /// the name would merge two genuinely different databases that share one, and the port
+    /// would merge a database with itself across origins and two Stacks with each other.
+    pub id: String,
     pub database: String,
     pub role: String,
     pub password: Option<String>,

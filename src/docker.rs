@@ -1,40 +1,76 @@
 //! The Live Docker Strategy: running containers, matched to the Project by the Compose
 //! working directory they were brought up from.
 //!
-//! The only Strategy there is today, and the one that will rank above every
-//! declaration-based Strategy once #5 adds them: a bound host port is ground truth — a
-//! container Docker reports as running, publishing a port, is a database that is actually
-//! there, where a compose file is only a statement of intent.
+//! The Strategy that ranks above every declaration-based one: a bound host port is ground
+//! truth — a container Docker reports as running, publishing a port, is a database that is
+//! actually there, where a compose file is only a statement of intent.
+//!
+//! What a sweep is and what a container offers are read from here by the Compose Strategy
+//! too, so that two Strategies vouching for one container cannot disagree about it
+//! (ADR-0008). Matching a container to a Project is this Strategy's alone.
 
 use std::path::Path;
 
 use crate::candidate::{Candidate, Origin};
 use crate::host::Host;
 
-/// The command this Strategy asks about the machine's containers, and the one binary it
-/// needs present. Absent, it is a Strategy that finds nothing rather than a fault.
-const PROGRAM: &str = "docker";
+/// The one binary either Strategy needs present — this one asks it about the machine's
+/// containers, and the Compose Strategy renders with it. Absent, it is a Strategy that
+/// finds nothing rather than a fault. Spelled once, so the two can never drift apart about
+/// which binary they shell out to.
+pub(crate) const PROGRAM: &str = "docker";
 
-/// The Candidates the running containers of this machine offer `project`.
-pub fn candidates(project: &Path, host: &dyn Host) -> Vec<Candidate> {
+/// One running container: the id `docker ps` listed it under, and the object
+/// `docker inspect` answered with.
+pub struct Inspected {
+    pub id: String,
+    pub json: serde_json::Value,
+}
+
+/// Every container Docker reports as running, inspected. Swept once per Plan and read by
+/// every Strategy that needs to know what is alive: two sweeps could disagree about the
+/// same machine, and a Candidate deduplicated against a container the other Strategy never
+/// saw is a Candidate deduplicated against nothing.
+pub fn sweep(project: &Path, host: &dyn Host) -> Vec<Inspected> {
+    running(project, host)
+        .iter()
+        .filter_map(|id| {
+            let inspected = host.run(PROGRAM, &["inspect", id], project)?;
+            if inspected.status != 0 {
+                return None;
+            }
+            // `docker inspect` answers with an array of one; unwrapped here so that every
+            // reader of a sweep sees a container rather than a list holding one. Moved out
+            // of the array rather than cloned out of it: an inspect object is a tree of
+            // tens of kilobytes, and copying all of it to drop a one-element wrapper is
+            // hundreds of allocations per container that are garbage immediately.
+            let serde_json::Value::Array(said) = serde_json::from_str(&inspected.stdout).ok()?
+            else {
+                return None;
+            };
+            Some(Inspected {
+                id: id.clone(),
+                json: said.into_iter().next()?,
+            })
+        })
+        .collect()
+}
+
+/// The Candidates the running containers of this machine offer `project`, in whatever order
+/// `docker ps` listed them. Ordering them is the chain's business and not a Strategy's:
+/// `plan::ranked` sorts every Strategy's Candidates together, on a key this one's own sort
+/// could only be a prefix of.
+pub fn candidates(project: &Path, host: &dyn Host, sweep: &[Inspected]) -> Vec<Candidate> {
     // Once, before anything is compared: the Project arrives as herdr names it, and the
     // labels arrive as Compose recorded them, and on macOS the same directory is `/var/…`
     // to one and `/private/var/…` to the other.
     let Some(project_root) = host.canonicalize(project) else {
         return Vec::new();
     };
-    let mut found: Vec<Candidate> = running(project, host)
+    sweep
         .iter()
-        .filter_map(|id| host.run(PROGRAM, &["inspect", id], project))
-        .filter(|inspected| inspected.status == 0)
-        .filter_map(|inspected| serde_json::from_str::<serde_json::Value>(&inspected.stdout).ok())
-        .filter_map(|inspected| candidate(inspected.get(0)?, &project_root, host))
-        .collect();
-    // `docker ps` lists in whichever order it lists, and the rank the title states must not
-    // be one of them: only consistent behaviour is learnable, so a Project resolves to the
-    // same Candidate every run.
-    found.sort_by(|one, other| (one.port, &one.container).cmp(&(other.port, &other.container)));
-    found
+        .filter_map(|inspected| candidate(inspected, &project_root, host))
+        .collect()
 }
 
 /// The ids of every container Docker reports as running. Liveness is asked of Docker and
@@ -64,25 +100,21 @@ fn running(project: &Path, host: &dyn Host) -> Vec<String> {
 /// "postgres" and is not a database — it is refused by publishing 3000 rather than 5432,
 /// so tightening this filter would buy nothing and would drop distributions that name
 /// themselves in ways nobody has thought of yet.
-const IMAGES: [&str; 4] = ["postgres", "pgvector", "timescale", "supabase"];
+pub(crate) const IMAGES: [&str; 4] = ["postgres", "pgvector", "timescale", "supabase"];
 
 /// The label Compose stamps every container it brings up with, naming the directory the
 /// compose file was run from. The one thing that attributes a container to a Project: a
 /// container without it cannot be attributed to any Project at all, and guessing which one
 /// owns it is how the wrong database gets edited.
-const COMPOSE_WORKING_DIR: &str = "com.docker.compose.project.working_dir";
+pub(crate) const COMPOSE_WORKING_DIR: &str = "com.docker.compose.project.working_dir";
 
 /// The role the official image starts as when nothing names one.
 const DEFAULT_ROLE: &str = "postgres";
 
 /// One container's `docker inspect` object as a Candidate, or `None` if it is not one of
 /// `project`'s: the wrong image, the wrong directory, or no reachable port.
-fn candidate(
-    inspected: &serde_json::Value,
-    project_root: &Path,
-    host: &dyn Host,
-) -> Option<Candidate> {
-    let config = inspected.get("Config")?;
+fn candidate(inspected: &Inspected, project_root: &Path, host: &dyn Host) -> Option<Candidate> {
+    let config = inspected.json.get("Config")?;
     let image = config.get("Image")?.as_str()?;
     if !IMAGES.iter().any(|known| image.contains(known)) {
         return None;
@@ -98,6 +130,17 @@ fn candidate(
     if !working_dir.starts_with(project_root) {
         return None;
     }
+    connection(inspected, Origin::Docker)
+}
+
+/// One running container as the connection it offers, whichever Strategy vouched for it, or
+/// `None` when nothing on the host can reach its PostgreSQL.
+///
+/// Shared rather than written twice: both Strategies can vouch for the same container, and
+/// two readings of one container that disagreed about its port or its role would produce two
+/// Candidates that no deduplication could then reconcile (ADR-0008).
+pub(crate) fn connection(inspected: &Inspected, origin: Origin) -> Option<Candidate> {
+    let config = inspected.json.get("Config")?;
     // The image's own defaults, because they are what the container that is running did:
     // an unset `POSTGRES_USER` started it as `postgres`, and an unset `POSTGRES_DB` gave it
     // a database named after whichever role that resolved to. An unset `POSTGRES_PASSWORD`
@@ -105,12 +148,16 @@ fn candidate(
     // that is refused.
     let role = setting(config, "POSTGRES_USER").unwrap_or(DEFAULT_ROLE);
     Some(Candidate {
-        origin: Origin::Docker,
+        origin,
+        // Carried forward from the `ps` listing rather than read back out of the inspect
+        // object: it is the same string for both Strategies because they read one sweep,
+        // where `Id` is Docker's own to report in the short form or the long one.
+        id: inspected.id.clone(),
         database: setting(config, "POSTGRES_DB").unwrap_or(role).to_string(),
         role: role.to_string(),
         password: setting(config, "POSTGRES_PASSWORD").map(str::to_string),
-        port: published_port(inspected)?,
-        container: name(inspected),
+        port: published_port(&inspected.json)?,
+        container: name(&inspected.json),
         read_only: false,
     })
 }

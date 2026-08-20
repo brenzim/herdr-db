@@ -6,9 +6,15 @@
 mod common;
 
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use common::plugin_root;
 use herdr_db::host::{Host, RealHost};
+
+/// Short enough that proving expiry costs the suite no real time. The deadline the Pane
+/// actually runs under is `host::DEADLINE`; what is under test here is that expiry ends the
+/// wait at all, which is the same code at either length.
+const TEST_DEADLINE: Duration = Duration::from_millis(200);
 
 /// An empty scratch directory of this test's own, so no run can be satisfied by something
 /// an earlier one left behind.
@@ -93,5 +99,79 @@ fn the_host_runs_a_command_and_answers_nothing_for_one_it_cannot_run() {
         RealHost.run("no-such-program-exists-here", &[], &dir),
         None,
         "a command that could not be run at all is an absence",
+    );
+}
+
+#[test]
+fn the_host_gives_up_on_a_command_that_never_finishes() {
+    let dir = scratch("run-deadline");
+
+    let started = Instant::now();
+    let gave_up = RealHost.run_within("/bin/sh", &["-c", "sleep 600"], &dir, TEST_DEADLINE);
+    let waited = started.elapsed();
+
+    assert_eq!(
+        gave_up, None,
+        "a command that outlives its deadline is an absence — every Strategy already reads \
+         that as 'found nothing', and a status would be a second rule each of them had to \
+         learn",
+    );
+    assert!(
+        waited < Duration::from_secs(30),
+        "the deadline has to end the wait rather than the command doing it: waited {waited:?} \
+         for a command that sleeps for ten minutes",
+    );
+}
+
+#[test]
+fn the_host_gives_up_on_a_command_whose_pipes_outlive_it() {
+    let dir = scratch("run-drain-deadline");
+
+    let started = Instant::now();
+    // The command exits at once, having handed its stdout to a background process of its
+    // own. A pipe reaches EOF when the last holder of its write end closes it, not when the
+    // child exits, so a wait that joins its readers unconditionally hangs here — the same
+    // hang the deadline exists to prevent, reached through the branch that succeeded.
+    let gave_up = RealHost.run_within(
+        "/bin/sh",
+        &["-c", "sleep 5 & echo said"],
+        &dir,
+        TEST_DEADLINE,
+    );
+    let waited = started.elapsed();
+
+    assert_eq!(
+        gave_up, None,
+        "a command still being read at its deadline is an absence, the same as one still \
+         running at it",
+    );
+    assert!(
+        waited < Duration::from_secs(2),
+        "the deadline has to end the drain rather than the pipe closing doing it: waited \
+         {waited:?} for a command whose stdout is held open for five seconds",
+    );
+}
+
+#[test]
+fn the_host_hears_out_a_command_that_says_more_than_a_pipe_will_hold() {
+    let dir = scratch("run-loud");
+    let spoken = 512 * 1024;
+
+    let ran = RealHost
+        .run(
+            "/bin/sh",
+            &[
+                "-c",
+                "yes said | head -c 524288; yes complained | head -c 524288 >&2",
+            ],
+            &dir,
+        )
+        .expect("a runnable command answers");
+
+    assert_eq!(
+        (ran.status, ran.stdout.len(), ran.stderr.len()),
+        (0, spoken, spoken),
+        "a rendered Compose Stack is far larger than a pipe buffer, so both pipes must be \
+         drained while the command still runs — waiting on the command first deadlocks",
     );
 }

@@ -6,7 +6,31 @@
 //! the text of an io error, and because a panic in a Pane is a crash the user watches
 //! happen (ADR-0004).
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+/// How long a command may take before the Host stops waiting for it.
+///
+/// A half-dead Docker Desktop — a far more common state than a cleanly stopped one — answers
+/// `docker` by never answering, and a Pane that draws nothing is worse than one that
+/// Declines. Long enough that a cold but healthy Docker still finishes first, short enough
+/// that a user who is watching does not conclude the plugin is broken.
+pub const DEADLINE: Duration = Duration::from_secs(10);
+
+/// How often the wait looks to see whether the command has finished. Small against
+/// `DEADLINE`, so expiry is punctual, and large enough that the wait costs nothing.
+const POLL: Duration = Duration::from_millis(10);
+
+/// How long a reader is given past the deadline once the command has finished.
+///
+/// A command that exits in the last poll window before `DEADLINE` has still succeeded, and
+/// its whole answer is sitting in the pipe — but the pipe closed microseconds ago and the
+/// reader has yet to be rescheduled to see it, so at the deadline itself it is always still
+/// reading. Long enough for that reschedule under load, short enough that a command which
+/// handed its pipe to a child of its own is still given up on rather than waited out.
+const GRACE: Duration = Duration::from_millis(250);
 
 /// What a command said. Held as owned `String`s because a Strategy reads them, and a test
 /// double has to be able to make one up.
@@ -29,9 +53,9 @@ pub trait Host {
     /// The entries directly inside `path`, or an empty `Vec` if it cannot be listed.
     fn list_dir(&self, path: &Path) -> Vec<PathBuf>;
 
-    /// Runs `program` to completion in `cwd`, or `None` if it could not be run at all. A
-    /// command that ran and failed is `Some`, with its status — that is an answer, not an
-    /// absence.
+    /// Runs `program` in `cwd`, or `None` if it could not be run at all, did not finish in
+    /// time, or was still being read at its deadline. A command that ran and failed is
+    /// `Some`, with its status — that is an answer, not an absence.
     fn run(&self, program: &str, args: &[&str], cwd: &Path) -> Option<Output>;
 
     /// `path` with every symlink resolved, or `None` if it cannot be resolved at all.
@@ -60,21 +84,128 @@ impl Host for RealHost {
     }
 
     fn run(&self, program: &str, args: &[&str], cwd: &Path) -> Option<Output> {
-        let out = std::process::Command::new(program)
-            .args(args)
-            .current_dir(cwd)
-            .output()
-            .ok()?;
-        Some(Output {
-            // A command killed by a signal reports no code; -1 says "it did not finish"
-            // without anyone having to look at signal numbers.
-            status: out.status.code().unwrap_or(-1),
-            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-        })
+        self.run_within(program, args, cwd, DEADLINE)
     }
 
     fn canonicalize(&self, path: &Path) -> Option<PathBuf> {
         std::fs::canonicalize(path).ok()
+    }
+}
+
+impl RealHost {
+    /// `Host::run` under the deadline given rather than `DEADLINE`. Exists so that a test can
+    /// prove expiry in milliseconds instead of paying the real deadline in wall clock on
+    /// every run of the suite; the Pane always goes through `run`.
+    pub fn run_within(
+        &self,
+        program: &str,
+        args: &[&str],
+        cwd: &Path,
+        deadline: Duration,
+    ) -> Option<Output> {
+        let mut child = Command::new(program)
+            .args(args)
+            .current_dir(cwd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .ok()?;
+
+        // Both pipes are drained on their own threads for the whole time the command runs. A
+        // wait that read them afterwards would deadlock on any command saying more than a
+        // pipe buffer holds — and a rendered Compose Stack says far more than that.
+        let said = drain(child.stdout.take()?);
+        let complained = drain(child.stderr.take()?);
+
+        let expires = Instant::now() + deadline;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => {}
+                Err(_) => return None,
+            }
+            if Instant::now() >= expires {
+                // The reader threads are left to end on their own once the pipes close: a
+                // command sick enough to outlive its deadline may have handed a pipe to a
+                // child of its own, and joining on that would be the hang this deadline
+                // exists to prevent.
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            std::thread::sleep(POLL);
+        };
+
+        Some(Output {
+            // A command killed by a signal reports no code; -1 says "it did not finish"
+            // without anyone having to look at signal numbers.
+            status: status.code().unwrap_or(-1),
+            stdout: drained(said, expires)?,
+            stderr: drained(complained, expires)?,
+        })
+    }
+}
+
+/// What a reader thread read, or `None` if it is still reading at `expires` — or at a
+/// `GRACE` from now, whichever is later.
+///
+/// The same deadline covers the drain as covers the wait. A pipe reaches EOF when the last
+/// holder of its write end closes it, which is not when the child exits: a command that
+/// hands its stdout to a background process of its own exits at once and leaves the pipe
+/// open behind it. Joining unconditionally there is the hang the deadline exists to
+/// prevent, reached through the branch where the command succeeded.
+///
+/// The grace is what keeps that from also discarding a command that merely finished late:
+/// the wait can only see an exit one poll after it happens, so a healthy command that
+/// answers just inside its deadline arrives here with the deadline already behind it.
+fn drained(reading: std::thread::JoinHandle<String>, expires: Instant) -> Option<String> {
+    let by = expires.max(Instant::now() + GRACE);
+    while !reading.is_finished() {
+        if Instant::now() >= by {
+            return None;
+        }
+        std::thread::sleep(POLL);
+    }
+    reading.join().ok()
+}
+
+/// Reads one of a command's pipes to its end on a thread of its own.
+fn drain(mut pipe: impl Read + Send + 'static) -> std::thread::JoinHandle<String> {
+    std::thread::spawn(move || {
+        let mut said = Vec::new();
+        let _ = pipe.read_to_end(&mut said);
+        // The buffer is reused where it can be: a rendered Compose Stack is the hundreds of
+        // kilobytes the drain above exists for, and `from_utf8_lossy` on valid UTF-8 borrows
+        // it only for `into_owned` to allocate and copy the whole thing a second time. A
+        // command that answers in something other than UTF-8 still degrades rather than
+        // fails, which is the whole rule this Host is written to.
+        String::from_utf8(said)
+            .unwrap_or_else(|said| String::from_utf8_lossy(said.as_bytes()).into_owned())
+    })
+}
+
+/// The drain boundary, driven directly. It is in here rather than in `tests/host.rs`
+/// because reaching it through `run_within` would mean timing a real command to exit inside
+/// the last poll window before its deadline, which is a race either way it lands.
+#[cfg(test)]
+mod tests {
+    use super::{Duration, Instant, drained};
+
+    #[test]
+    fn a_reader_still_reading_at_an_expired_deadline_is_given_its_grace() {
+        let reading = std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(20));
+            "said".to_string()
+        });
+
+        assert_eq!(
+            drained(reading, Instant::now()),
+            Some("said".to_string()),
+            "a command that finishes in the last poll window has still succeeded, and its \
+             reader has yet to be rescheduled to see the pipe close: reading a whole \
+             rendered Stack as 'found nothing' because the render took 9.995 seconds is the \
+             Decline the deadline is not there to produce",
+        );
     }
 }
