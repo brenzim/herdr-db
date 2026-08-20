@@ -10,6 +10,7 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 
 use common::sources;
+use herdr_db::compose::Stopped;
 use herdr_db::context::InvocationContext;
 use herdr_db::host::{Host, Output};
 use herdr_db::plan::{Diagnosis, Launch, Plan, plan};
@@ -1236,6 +1237,11 @@ impl Host for ComposeHost {
         }
         entries.sort();
         entries.dedup();
+        // Handed back in the order a Project is *not* read in. `read_dir` answers in
+        // whatever order the filesystem holds the entries, so a double that answered
+        // helpfully sorted would let a walk inherit its order from the Host and still look
+        // stable here — while the Decline it builds read differently on every machine.
+        entries.reverse();
         entries
     }
 
@@ -1491,11 +1497,13 @@ fn a_service_qualifies_on_its_image_or_its_declared_port_or_a_postgres_key() {
 fn a_qualifying_service_with_nothing_running_it_is_not_a_candidate() {
     // ADR-0008: a declaration is a statement of intent. With no container behind it there
     // is no port to reach, no role and no password, and a Launch against the declared one
-    // is the confidently-wrong Pane this plugin exists to prevent. Telling the user which
-    // database is declared and stopped is #5's own Decline, not this.
-    assert_eq!(
-        planned_against(&ComposeHost::stack(INFRA, FX2)),
-        found_nothing(),
+    // is the confidently-wrong Pane this plugin exists to prevent. What the user is told
+    // instead is asserted where that Decline is.
+    assert!(
+        !matches!(
+            planned_against(&ComposeHost::stack(INFRA, FX2)),
+            Plan::Launch(_)
+        ),
         "a Stack with nothing running it produced a Candidate anyway",
     );
 }
@@ -1537,9 +1545,8 @@ fn a_container_belongs_to_a_stack_only_when_it_names_that_stacks_own_directory_a
             working_dir: Some(working_dir),
             ..built(INFRA, "warehouse")
         }]);
-        assert_eq!(
-            planned_against(&host),
-            found_nothing(),
+        assert!(
+            !matches!(planned_against(&host), Plan::Launch(_)),
             "a container brought up in {working_dir} was attributed to the Stack in {INFRA}",
         );
     }
@@ -1551,9 +1558,8 @@ fn a_container_belongs_to_a_stack_only_when_it_names_that_stacks_own_directory_a
             service,
             ..built(INFRA, "warehouse")
         }]);
-        assert_eq!(
-            planned_against(&host),
-            found_nothing(),
+        assert!(
+            !matches!(planned_against(&host), Plan::Launch(_)),
             "a container labelled {service:?} was matched to the `warehouse` service",
         );
     }
@@ -1688,6 +1694,163 @@ fn never_panics_whatever_compose_says() {
             "the render {said} was not declined on",
         );
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// The declared-but-not-running Decline.
+// ---------------------------------------------------------------------------------------
+
+/// The Diagnosis a Project declines with. A Launch here is the failure the whole Decline
+/// exists to be distinguishable from, so it is named rather than swallowed.
+fn declined(host: &dyn Host) -> Diagnosis {
+    match planned_against(host) {
+        Plan::Decline(diagnosis) => diagnosis,
+        Plan::Launch(launch) => panic!(
+            "the Project resolved to `{}` rather than declining",
+            launch.title,
+        ),
+    }
+}
+
+/// The databases a declining Project declares and is not running, in the order the user is
+/// told about them.
+fn declared_but_stopped(host: &dyn Host) -> Vec<Stopped> {
+    match declined(host) {
+        Diagnosis::DeclaredButNotRunning { stopped } => stopped,
+        other => panic!(
+            "the Project declined without naming a stopped database: {}",
+            other.message(),
+        ),
+    }
+}
+
+#[test]
+fn a_declared_database_nothing_is_running_names_its_container_service_and_file() {
+    // ADR-0008 already refuses to launch at a declaration, which leaves the user with a
+    // Pane that says nothing they can act on. What they can act on is exactly this: the
+    // container Compose would have brought up, which service it is, and which file said so
+    // — named relative to the Project, since the absolute prefix is the part they know.
+    let host = ComposeHost::stack(INFRA, FX1);
+    let stopped = declared_but_stopped(&host);
+    assert_eq!(
+        stopped.len(),
+        1,
+        "the one database fx1 declares was not named once: {stopped:?}",
+    );
+    assert_eq!(stopped[0].container, "fx1-db-1");
+    assert_eq!(stopped[0].service, "db");
+    assert_eq!(stopped[0].file, PathBuf::from("infra/compose.yaml"));
+
+    let said = Diagnosis::DeclaredButNotRunning { stopped }.message();
+    for named in ["fx1-db-1", "infra/compose.yaml"] {
+        assert!(
+            said.contains(named),
+            "the Decline never says `{named}`, so the user cannot act on it: {said}",
+        );
+    }
+}
+
+#[test]
+fn the_named_container_is_the_one_the_renders_own_project_name_would_produce() {
+    // `<name>-<service>-1`, where `<name>` is what the render resolved for itself — by which
+    // point `COMPOSE_PROJECT_NAME`, a top-level `name:` and the directory default have
+    // already been decided between. fx2 declares `name: mystack` while sitting in `infra/`,
+    // so a name derived from the directory here sends the user looking for
+    // `infra-warehouse-1`, which no `docker ps` will ever list.
+    let named: Vec<String> = declared_but_stopped(&ComposeHost::stack(INFRA, FX2))
+        .into_iter()
+        .map(|it| it.container)
+        .collect();
+    assert_eq!(named, ["mystack-analytics-1", "mystack-warehouse-1"]);
+}
+
+/// A second Stack, sorting before `INFRA`, so that "ordered by Stack directory" is a
+/// different order from the one the Project was built in.
+const APPS: &str = "/Users/b/AI/orders/apps";
+
+#[test]
+fn every_stopped_database_in_the_project_is_named_ordered_by_stack_directory() {
+    // Naming one of several is actively misleading: the user starts the one named, presses
+    // `r`, and gets the same screen back naming another. And the order has to be the
+    // Project's rather than the walk's — a diagnosis that reads differently on each retry
+    // is one the user cannot tell apart from a Project that changed underneath them.
+    let host = ComposeHost::stack(INFRA, FX2).and_stack(APPS, FX1);
+    let named: Vec<String> = declared_but_stopped(&host)
+        .into_iter()
+        .map(|it| it.container)
+        .collect();
+    assert_eq!(
+        named,
+        ["fx1-db-1", "mystack-analytics-1", "mystack-warehouse-1"],
+    );
+}
+
+#[test]
+fn a_project_with_one_stack_running_and_another_stopped_launches_from_the_running_one() {
+    // This Decline is about a Project that resolved nothing, not about a database that is
+    // down. Somewhere to work beats a diagnosis about somewhere else, so the Stack that is
+    // up opens and the one that is down is not mentioned — surfacing it alongside the
+    // Launch is #10's job, where it can be an unselectable entry in the picker.
+    let host = ComposeHost::stack(INFRA, FX2)
+        .and_stack(APPS, FX1)
+        .running(vec![built(INFRA, "warehouse")]);
+    assert_eq!(launched(&host).title, "warehouse@5432 · compose · app");
+}
+
+#[test]
+fn the_remedy_starts_the_named_service_from_the_stacks_own_directory() {
+    // Naming the service is load-bearing twice over: it is what makes the line about one
+    // database, and it is what activates the profile of a service behind `profiles:` —
+    // `analytics` is one, and a bare `docker compose up -d` would not start it.
+    let said = declined(&ComposeHost::stack(INFRA, FX2)).message();
+    for remedy in [
+        "docker compose up -d analytics",
+        "docker compose up -d warehouse",
+        INFRA,
+    ] {
+        assert!(
+            said.contains(remedy),
+            "the Decline never offers `{remedy}`: {said}",
+        );
+    }
+
+    // The remedy is run from the Stack's directory and never handed the file with a `-f`:
+    // a `-f` drops the `docker-compose.override.yml` Compose loads beside it, which is the
+    // exact mistake the render itself is forbidden from making — pasted by the user it
+    // starts the Stack on a port nothing here resolved.
+    assert!(
+        !said.contains(" -f "),
+        "the remedy passes a `-f`, dropping whatever Compose would have loaded beside the \
+         file: {said}",
+    );
+
+    // `start-db` does not exist until #12, and a diagnosis pointing at an action the user
+    // cannot invoke is worse than one with no remedy at all.
+    assert!(
+        !said.contains("start-db"),
+        "the Decline names an action that does not exist yet: {said}",
+    );
+}
+
+#[test]
+fn the_file_the_decline_names_is_the_one_compose_itself_would_load() {
+    // A Stack is a directory and the Decline names one file out of it: the one Compose's
+    // own precedence picks. Named wrongly, the user opens a file that declared nothing —
+    // or, worse, edits it and watches the database keep coming up the old way.
+    let host = ComposeHost::empty()
+        .holding("/Users/b/AI/orders/infra/docker-compose.yml")
+        .rendering(INFRA, Render::Says(FX1));
+    assert_eq!(
+        declared_but_stopped(&host)[0].file,
+        PathBuf::from("infra/docker-compose.yml"),
+    );
+
+    let host = ComposeHost::stack(INFRA, FX1).holding("/Users/b/AI/orders/infra/compose.yml");
+    assert_eq!(
+        declared_but_stopped(&host)[0].file,
+        PathBuf::from("infra/compose.yaml"),
+        "the Decline named a file Compose would not have loaded",
+    );
 }
 
 // ---------------------------------------------------------------------------------------

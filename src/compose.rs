@@ -64,38 +64,84 @@ const COMPOSE_SERVICE: &str = "com.docker.compose.service";
 /// as the first.
 const COMPOSE_NUMBER: &str = "com.docker.compose.container-number";
 
-/// The Candidates the Stacks beneath `project` offer, given the containers already swept.
-pub fn candidates(project: &Path, host: &dyn Host, sweep: &[Inspected]) -> Vec<Candidate> {
+/// What the Stacks beneath a Project say, taken together: the connections their running
+/// containers offer, and the databases they declare that nothing is running.
+#[derive(Debug, Default)]
+pub struct Rendered {
+    pub candidates: Vec<Candidate>,
+    /// Every one of them, ordered by Stack directory. Told about one of two, the user
+    /// starts that one, retries, and reads the same screen back naming the other.
+    pub stopped: Vec<Stopped>,
+}
+
+/// One database a Stack declares with no container behind it — a statement of intent that
+/// nothing has acted on, which is the commonest state a machine is in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stopped {
+    /// The container Compose would bring the service up as, `<name>-<service>-1`. `<name>`
+    /// is the render's *own* resolved project name, which has already decided between
+    /// `COMPOSE_PROJECT_NAME`, a top-level `name:` and the directory default — deriving it
+    /// from the directory here would name a container that does not exist for two of those
+    /// three.
+    pub container: String,
+    /// The service the Stack declares it as, which is what the remedy has to name.
+    pub service: String,
+    /// The Stack's Compose file as Compose's own precedence picked it out of the directory,
+    /// relative to the Project: the absolute prefix is the part the user already knows.
+    pub file: PathBuf,
+    /// The Stack's own directory, absolute, because the remedy is run from there and a
+    /// Pane's working directory is this plugin's install directory (ADR-0004).
+    pub directory: PathBuf,
+}
+
+/// One Stack: a directory, and the single file Compose would load in it.
+struct Stack {
+    directory: PathBuf,
+    file: PathBuf,
+}
+
+/// What the Stacks beneath `project` offer, given the containers already swept.
+pub fn candidates(project: &Path, host: &dyn Host, sweep: &[Inspected]) -> Rendered {
     // Once, before anything is compared: every Stack directory is then built by descending
     // from a canonical root, and the Compose labels are canonicalised to meet them.
     let Some(project_root) = host.canonicalize(project) else {
-        return Vec::new();
+        return Rendered::default();
     };
-    let mut found: Vec<Candidate> = stacks(&project_root, host)
-        .iter()
-        .filter_map(|stack| Some((stack, render(stack, host)?)))
-        .flat_map(|(stack, rendered)| services(&rendered, stack, host, sweep))
-        .collect();
+    let mut found = Rendered::default();
+    for stack in stacks(&project_root, host) {
+        let Some(said) = render(&stack.directory, host) else {
+            continue;
+        };
+        services(&said, &stack, &project_root, host, sweep, &mut found);
+    }
     // Stacks are walked in a stable order already, but a Stack can declare several
-    // databases and the rank the title states must not depend on the order a JSON object
-    // happens to iterate in.
-    found.sort_by(|one, other| (one.port, &one.container).cmp(&(other.port, &other.container)));
+    // databases and neither the rank the title states nor the order the Decline reads in
+    // may depend on the order a JSON object happens to iterate in.
+    found
+        .candidates
+        .sort_by(|one, other| (one.port, &one.container).cmp(&(other.port, &other.container)));
+    found.stopped.sort_by(|one, other| {
+        (&one.directory, &one.service).cmp(&(&other.directory, &other.service))
+    });
     found
 }
 
-/// Every Stack directory beneath `root`, in a stable order. `root` itself is one when it
-/// holds a Compose file — the commonest layout there is.
-fn stacks(root: &Path, host: &dyn Host) -> Vec<PathBuf> {
+/// Every Stack beneath `root`, in a stable order. `root` itself is one when it holds a
+/// Compose file — the commonest layout there is.
+fn stacks(root: &Path, host: &dyn Host) -> Vec<Stack> {
     let mut found = Vec::new();
     walk(root, 0, host, &mut found);
-    found.sort();
+    found.sort_by(|one, other| one.directory.cmp(&other.directory));
     found
 }
 
-fn walk(directory: &Path, depth: usize, host: &dyn Host, found: &mut Vec<PathBuf>) {
+fn walk(directory: &Path, depth: usize, host: &dyn Host, found: &mut Vec<Stack>) {
     let entries = host.list_dir(directory);
-    if entries.iter().any(|entry| is_compose_file(entry)) {
-        found.push(directory.to_path_buf());
+    if let Some(file) = compose_file(&entries) {
+        found.push(Stack {
+            directory: directory.to_path_buf(),
+            file,
+        });
     }
     if depth == DEPTH {
         return;
@@ -121,10 +167,17 @@ fn walk(directory: &Path, depth: usize, host: &dyn Host, found: &mut Vec<PathBuf
     }
 }
 
-fn is_compose_file(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| COMPOSE_FILES.contains(&name))
+/// The one file of `entries` Compose would load, or `None` when the directory is not a
+/// Stack. `COMPOSE_FILES` is in Compose's own precedence order, so the first name that is
+/// present is the one that wins — and the other three are named by nothing, because naming
+/// them would send the user to edit a file that declared nothing.
+fn compose_file(entries: &[PathBuf]) -> Option<PathBuf> {
+    COMPOSE_FILES.iter().find_map(|wanted| {
+        entries
+            .iter()
+            .find(|entry| entry.file_name().and_then(|name| name.to_str()) == Some(*wanted))
+            .cloned()
+    })
 }
 
 /// What Compose says the Stack in `directory` is, or `None` when it would not say.
@@ -142,23 +195,64 @@ fn render(directory: &Path, host: &dyn Host) -> Option<serde_json::Value> {
     serde_json::from_str(&rendered.stdout).ok()
 }
 
-/// The Candidates a rendered Stack offers: one per qualifying service that something is
-/// running.
+/// What a rendered Stack offers, appended to `found`: a Candidate for every qualifying
+/// service something is running, and a `Stopped` for every one nothing is.
+///
+/// The two are exclusive and neither is a fallback for the other. A service whose container
+/// is running but publishes nothing reachable is neither: it is not a connection, and
+/// `docker compose up -d` would not change that, so telling the user to run it would send
+/// them round a loop.
 fn services(
-    rendered: &serde_json::Value,
-    directory: &Path,
+    said: &serde_json::Value,
+    stack: &Stack,
+    project_root: &Path,
     host: &dyn Host,
     sweep: &[Inspected],
-) -> Vec<Candidate> {
-    let Some(services) = rendered.get("services").and_then(|it| it.as_object()) else {
-        return Vec::new();
+    found: &mut Rendered,
+) {
+    let Some(services) = said.get("services").and_then(|it| it.as_object()) else {
+        return;
     };
-    services
-        .iter()
-        .filter(|(_, service)| qualifies(service))
-        .filter_map(|(name, _)| container(sweep, directory, name, host))
-        .filter_map(|inspected| docker::connection(inspected, Origin::Compose))
-        .collect()
+    for (service, declared) in services {
+        if !qualifies(declared) {
+            continue;
+        }
+        match container(sweep, &stack.directory, service, host) {
+            Some(inspected) => found
+                .candidates
+                .extend(docker::connection(inspected, Origin::Compose)),
+            None => found.stopped.push(Stopped {
+                container: container_name(said, &stack.directory, service),
+                service: service.clone(),
+                file: stack
+                    .file
+                    .strip_prefix(project_root)
+                    .unwrap_or(&stack.file)
+                    .to_path_buf(),
+                directory: stack.directory.clone(),
+            }),
+        }
+    }
+}
+
+/// The container Compose would have brought `service` up as.
+///
+/// `<name>` is read back out of the render rather than derived, because by the time Compose
+/// writes it there it has already resolved `COMPOSE_PROJECT_NAME` over a top-level `name:`
+/// over the directory the Stack sits in. The fallback is that same directory — Compose's own
+/// default, and reachable only from a render that named no project at all.
+fn container_name(said: &serde_json::Value, directory: &Path, service: &str) -> String {
+    let project = said
+        .get("name")
+        .and_then(|it| it.as_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| {
+            directory
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default()
+        });
+    format!("{project}-{service}-1")
 }
 
 /// Whether a rendered service is a PostgreSQL.

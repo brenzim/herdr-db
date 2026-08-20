@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use crate::candidate::Candidate;
 use crate::client;
-use crate::compose;
+use crate::compose::{self, Stopped};
 use crate::context::{InvocationContext, RawContext};
 use crate::docker;
 use crate::host::Host;
@@ -33,7 +33,14 @@ pub enum Diagnosis {
     ContextEmpty,
     ContextUnreadable,
     NoProjectIdentified,
-    NoConnectionFound { project: PathBuf },
+    /// The Project declares databases and nothing is running any of them — the state a cold
+    /// machine is in, and the only Decline the user can act on without leaving the Pane.
+    DeclaredButNotRunning {
+        stopped: Vec<Stopped>,
+    },
+    NoConnectionFound {
+        project: PathBuf,
+    },
 }
 
 /// Turns what herdr said, plus the world, into a Plan. Never panics: every fault is a
@@ -57,13 +64,22 @@ pub fn plan(context: &InvocationContext, host: &dyn Host) -> Plan {
     // disagree about the same machine, and a Strategy's opinion is only comparable with
     // another's when both were formed from the same containers.
     let sweep = docker::sweep(&project, host);
+    let rendered = compose::candidates(&project, host, &sweep);
     let mut candidates = docker::candidates(&project, host, &sweep);
-    candidates.extend(compose::candidates(&project, host, &sweep));
+    candidates.extend(rendered.candidates);
     let candidates = ranked(candidates);
     let of = candidates.len();
     // A Strategy that found nothing is not a fault of its own: Docker being absent looks
     // from here exactly like Docker running nothing, and both leave the chain to go on.
     let Some(candidate) = candidates.into_iter().next() else {
+        // Only here, with nothing resolved at all: a Project with one Stack up and another
+        // down opens the one that is up and says nothing about the other, because something
+        // to work in beats a diagnosis about something else.
+        if !rendered.stopped.is_empty() {
+            return Plan::Decline(Diagnosis::DeclaredButNotRunning {
+                stopped: rendered.stopped,
+            });
+        }
         return Plan::Decline(Diagnosis::NoConnectionFound { project });
     };
     Plan::Launch(Launch {
@@ -97,6 +113,32 @@ fn ranked(mut candidates: Vec<Candidate>) -> Vec<Candidate> {
     candidates
 }
 
+/// One line per stopped database, each of them the whole remedy for that one database.
+///
+/// The remedy is a Compose command and not the `start-db` action, which does not exist
+/// until #12: a diagnosis pointing at something the user cannot invoke is worse than one
+/// with no remedy at all. It names the *directory* rather than passing the file with `-f`,
+/// because a `-f` drops the `docker-compose.override.yml` Compose loads beside it and would
+/// start the Stack on a port the render never saw. And it names the service explicitly,
+/// which is both what makes the line about one database and what activates the profile of a
+/// service behind `profiles:`.
+fn listed(stopped: &[Stopped]) -> String {
+    stopped
+        .iter()
+        .map(|it| {
+            format!(
+                "\n  {} — service `{}`, declared in {} — start it with: \
+                 cd {} && docker compose up -d {}",
+                it.container,
+                it.service,
+                it.file.display(),
+                it.directory.display(),
+                it.service,
+            )
+        })
+        .collect()
+}
+
 impl Diagnosis {
     /// What to tell the user. Each fault reads differently because each has a different
     /// remedy: a herdr that said nothing is not a herdr that said something broken, and
@@ -116,6 +158,15 @@ impl Diagnosis {
             Self::NoProjectIdentified => "herdr named no Worktree, no focused Pane and no \
                  workspace, so there is no Project to resolve a database for."
                 .to_string(),
+            Self::DeclaredButNotRunning { stopped } => {
+                let count = stopped.len();
+                let opening = if count == 1 {
+                    "this Project declares a database that is not running:".to_string()
+                } else {
+                    format!("this Project declares {count} databases and none is running:")
+                };
+                format!("{opening}{}", listed(stopped))
+            }
             Self::NoConnectionFound { project } => format!(
                 "no database connection was found for the Project at {}.",
                 project.display(),
