@@ -6,6 +6,7 @@
 
 mod common;
 
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 
 use common::sources;
@@ -200,6 +201,11 @@ struct Container {
     image: &'static str,
     /// The Compose label attributing the container to a directory, when it carries one.
     working_dir: Option<&'static str>,
+    /// The Compose label naming which service of that directory's Stack this is.
+    service: Option<&'static str>,
+    /// The Compose label numbering this replica of the service, as the string Docker
+    /// stores it as.
+    number: Option<&'static str>,
     /// `NetworkSettings.Ports`, in Docker's own shape rather than a tidied one.
     ports: Value,
     env: Vec<&'static str>,
@@ -213,6 +219,8 @@ fn container() -> Container {
         name: "/orders-db",
         image: "postgres:16",
         working_dir: Some("/Users/b/AI/orders/infra"),
+        service: None,
+        number: None,
         ports: published(&["5434"]),
         env: vec!["POSTGRES_USER=app", "POSTGRES_DB=orders", "PATH=/usr/bin"],
     }
@@ -236,6 +244,12 @@ impl Container {
         let mut labels = json!({"org.opencontainers.image.ref.name": "postgres"});
         if let Some(working_dir) = self.working_dir {
             labels["com.docker.compose.project.working_dir"] = json!(working_dir);
+        }
+        if let Some(service) = self.service {
+            labels["com.docker.compose.service"] = json!(service);
+        }
+        if let Some(number) = self.number {
+            labels["com.docker.compose.container-number"] = json!(number);
         }
         json!([{
             "Name": self.name,
@@ -986,6 +1000,694 @@ fn two_candidates_on_one_port_are_ordered_by_the_container_name() {
         "api@5434 · docker · app · 1 of 2",
         "two containers publishing one port did not resolve by name",
     );
+}
+
+// ---------------------------------------------------------------------------------------
+// The Compose-renderer Strategy.
+//
+// Every render below is a verbatim capture of `docker compose config --format json` from a
+// real Compose (v5.0.1), so that the shapes these tests pin are Compose's and not this
+// plugin's idea of them: `published` is a string and `target` a number, a `build:` service
+// carries no `image` key at all, and an unset interpolation renders as a key with an empty
+// value. No test here runs Docker (AC 16).
+// ---------------------------------------------------------------------------------------
+
+/// fx1 — an `!override` on the ports, and a `build:` service with no `image`. The base file
+/// declares `db` on `5432:5432`; `docker-compose.override.yml` declares
+/// `ports: !override ["5434:5432"]`, and Compose has already merged the two down to the
+/// single `5434` entry below.
+const FX1: &str = r#"{
+  "name": "fx1",
+  "networks": { "default": { "name": "fx1_default", "ipam": {} } },
+  "services": {
+    "api": {
+      "build": { "context": "/Users/b/AI/orders/infra", "dockerfile": "Dockerfile" },
+      "command": null,
+      "entrypoint": null,
+      "environment": { "DATABASE_URL": "postgres://app@db:5432/appdb" },
+      "networks": { "default": null }
+    },
+    "db": {
+      "command": null,
+      "entrypoint": null,
+      "environment": { "POSTGRES_DB": "appdb", "POSTGRES_USER": "app" },
+      "image": "postgres:16",
+      "networks": { "default": null },
+      "ports": [
+        { "mode": "ingress", "target": 5432, "published": "5434", "protocol": "tcp" }
+      ]
+    }
+  }
+}"#;
+
+/// fx2 — the case this Strategy exists for. `warehouse` is `build:`-only, so it renders with
+/// no `image` key and the Live Docker Strategy cannot see it; it qualifies on its 5432
+/// target and its `POSTGRES_*` keys alone. `analytics` is behind a profile and is only here
+/// because the render asked for every profile. `cache` qualifies on nothing. The
+/// `POSTGRES_PASSWORD` came out of `env_file: [db.env]` and is an identification signal and
+/// never a credential (ADR-0008).
+const FX2: &str = r#"{
+  "name": "mystack",
+  "services": {
+    "analytics": {
+      "profiles": [ "tools" ],
+      "command": null,
+      "entrypoint": null,
+      "environment": { "POSTGRES_PASSWORD": "fromenvfile" },
+      "image": "timescale/timescaledb:latest-pg16",
+      "networks": { "default": null },
+      "ports": [
+        { "mode": "ingress", "host_ip": "127.0.0.1", "target": 5432, "published": "5435", "protocol": "tcp" }
+      ]
+    },
+    "cache": {
+      "command": null,
+      "entrypoint": null,
+      "image": "redis:7",
+      "networks": { "default": null },
+      "ports": [
+        { "mode": "ingress", "target": 6379, "published": "6379", "protocol": "tcp" }
+      ]
+    },
+    "warehouse": {
+      "build": { "context": "/Users/b/AI/orders/infra", "dockerfile": "Dockerfile.db" },
+      "command": null,
+      "entrypoint": null,
+      "environment": { "POSTGRES_DB": "warehouse", "POSTGRES_PASSWORD": "secret" },
+      "networks": { "default": null },
+      "ports": [
+        { "mode": "ingress", "target": 5432, "published": "5432", "protocol": "tcp" },
+        { "mode": "ingress", "target": 5432, "published": "15432", "protocol": "tcp" },
+        { "mode": "ingress", "target": 9187, "published": "9187", "protocol": "tcp" }
+      ]
+    }
+  }
+}"#;
+
+/// fx5 — a port exposed but never published: the entry carries no `published` key at all.
+/// Still a database by its 5432 target.
+const FX5: &str = r#"{
+  "name": "fx5",
+  "services": {
+    "db": {
+      "expose": [ "5432" ],
+      "image": "postgres:16",
+      "ports": [ { "mode": "ingress", "target": 5432, "protocol": "tcp" } ]
+    }
+  }
+}"#;
+
+/// fx7 — an interpolated variable that is not set. Compose renders the key with an empty
+/// value, which the image reads as unset and this Strategy reads as "this is a database".
+/// Nothing else here says PostgreSQL: no image, and no port at all.
+const FX7: &str = r#"{
+  "name": "fx7",
+  "services": {
+    "db": {
+      "build": { "context": "/Users/b/AI/orders/infra", "dockerfile": "Dockerfile" },
+      "environment": { "POSTGRES_PASSWORD": "", "POSTGRES_USER": "" }
+    }
+  }
+}"#;
+
+/// A service that says PostgreSQL with its image alone: no port declared, and nothing in
+/// its environment.
+const IMAGE_ONLY: &str = r#"{
+  "name": "fx9",
+  "services": { "db": { "image": "pgvector/pgvector:pg16" } }
+}"#;
+
+/// A service that says PostgreSQL with its declared port alone: an image nobody could
+/// recognise, and credentials that live somewhere this Strategy never looks.
+const TARGET_ONLY: &str = r#"{
+  "name": "fx10",
+  "services": {
+    "db": {
+      "image": "ghcr.io/acme/database:1.4",
+      "ports": [ { "mode": "ingress", "target": 5432, "published": "5432", "protocol": "tcp" } ]
+    }
+  }
+}"#;
+
+/// A Stack whose only service is a Redis. Nothing about it says PostgreSQL, so nothing may
+/// resolve from it however alive its container is.
+const CACHE_ONLY: &str = r#"{
+  "name": "fx8",
+  "services": {
+    "cache": {
+      "image": "redis:7",
+      "ports": [ { "mode": "ingress", "target": 6379, "published": "6379", "protocol": "tcp" } ]
+    }
+  }
+}"#;
+
+/// What `docker compose config` does when a Stack is rendered.
+enum Render {
+    /// It rendered. Compose writes its warnings — a second config file found, a variable it
+    /// had to interpolate as empty — to stderr while exiting 0, so every successful render
+    /// here carries one: a Strategy that read stderr as failure would resolve nothing on a
+    /// perfectly ordinary machine.
+    Says(&'static str),
+    /// It refused: exit 1, an empty stdout, and the reason on stderr. An unset `${VAR:?}`
+    /// and a directory holding no compose file at all are both this shape.
+    Refuses,
+    /// There is no `docker` on this machine to render with at all, which is the state most
+    /// machines this plugin runs on are in.
+    Absent,
+}
+
+/// A Project as `list_dir` reports it, together with the Docker that is running and what
+/// `docker compose config` says in each of its Stacks.
+struct ComposeHost {
+    /// Every path the Project holds. A directory exists here because something is inside
+    /// it, which is all a walk of the filesystem can see of one anyway.
+    paths: Vec<String>,
+    /// A Stack's directory, and what rendering it says.
+    renders: Vec<(String, Render)>,
+    containers: Vec<Container>,
+    links: Vec<(&'static str, Option<&'static str>)>,
+    /// The directories `docker compose config` was actually run in, in order, so that a
+    /// test can assert on the rendering that did *not* happen.
+    rendered_in: RefCell<Vec<PathBuf>>,
+}
+
+impl ComposeHost {
+    /// A Project with nothing in it and nothing running.
+    fn empty() -> Self {
+        Self {
+            paths: Vec::new(),
+            renders: Vec::new(),
+            containers: Vec::new(),
+            links: Vec::new(),
+            rendered_in: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// A Project holding one Stack in `directory` — a `compose.yaml` there — which renders
+    /// as `said`.
+    fn stack(directory: &str, said: &'static str) -> Self {
+        Self::empty().and_stack(directory, said)
+    }
+
+    fn and_stack(self, directory: &str, said: &'static str) -> Self {
+        self.holding(&format!("{directory}/compose.yaml"))
+            .rendering(directory, Render::Says(said))
+    }
+
+    /// A path in the Project that is not itself a Stack: a file, or a directory named by
+    /// something inside it.
+    fn holding(mut self, path: &str) -> Self {
+        self.paths.push(path.to_string());
+        self
+    }
+
+    fn rendering(mut self, directory: &str, render: Render) -> Self {
+        self.renders.push((directory.to_string(), render));
+        self
+    }
+
+    fn running(mut self, containers: Vec<Container>) -> Self {
+        self.containers = containers;
+        self
+    }
+
+    /// Resolves every path under `from` to the same path under `to`.
+    fn linking(mut self, from: &'static str, to: Option<&'static str>) -> Self {
+        self.links.push((from, to));
+        self
+    }
+}
+
+impl Host for ComposeHost {
+    fn read_file(&self, _path: &Path) -> Option<String> {
+        None
+    }
+
+    fn list_dir(&self, path: &Path) -> Vec<PathBuf> {
+        let mut entries: Vec<PathBuf> = Vec::new();
+        for held in &self.paths {
+            let mut inside = Path::new(held);
+            while let Some(parent) = inside.parent() {
+                if parent == path {
+                    entries.push(inside.to_path_buf());
+                }
+                inside = parent;
+            }
+        }
+        entries.sort();
+        entries.dedup();
+        entries
+    }
+
+    fn run(&self, program: &str, args: &[&str], cwd: &Path) -> Option<Output> {
+        if program != "docker" {
+            return None;
+        }
+        match args {
+            ["ps", "--filter", "status=running", "--format", "{{.ID}}"] => Some(Output {
+                status: 0,
+                stdout: self
+                    .containers
+                    .iter()
+                    .map(|container| format!("{}\n", container.id))
+                    .collect(),
+                stderr: String::new(),
+            }),
+            ["inspect", id] => Some(Output {
+                status: 0,
+                stdout: self.containers.iter().find(|it| it.id == *id)?.inspected(),
+                stderr: String::new(),
+            }),
+            // The render, exactly as the Strategy must ask for it: in the Stack's own
+            // directory, with every profile, and with no `-f` — a second `-f` would merge a
+            // file Compose itself would not have loaded.
+            ["compose", "--profile", "*", "config", "--format", "json"] => {
+                self.rendered_in.borrow_mut().push(cwd.to_path_buf());
+                let (_, render) = self
+                    .renders
+                    .iter()
+                    .find(|(directory, _)| Path::new(directory) == cwd)?;
+                Some(match render {
+                    Render::Says(said) => Output {
+                        status: 0,
+                        stdout: (*said).to_string(),
+                        stderr: "level=warning msg=\"Found multiple config files\"".to_string(),
+                    },
+                    Render::Refuses => Output {
+                        status: 1,
+                        stdout: String::new(),
+                        stderr: "no configuration file provided: not found".to_string(),
+                    },
+                    Render::Absent => return None,
+                })
+            }
+            // Anything else is a call this double was never told to expect, and answering it
+            // plausibly would hide the Strategy having changed its mind about how it asks.
+            _ => None,
+        }
+    }
+
+    fn canonicalize(&self, path: &Path) -> Option<PathBuf> {
+        let raw = path.to_str()?;
+        let Some((from, to)) = self
+            .links
+            .iter()
+            .find(|(from, _)| raw == *from || raw.starts_with(&format!("{from}/")))
+        else {
+            return Some(path.to_path_buf());
+        };
+        to.map(|to| PathBuf::from(raw.replacen(from, to, 1)))
+    }
+}
+
+/// The container Compose brought up for a Stack's service. Deliberately built from a local
+/// `Dockerfile`, so its image is `<name>-<service>` and the Live Docker Strategy's image
+/// filter cannot see it: every Launch below is one only the Compose Strategy can produce.
+fn built(working_dir: &'static str, service: &'static str) -> Container {
+    Container {
+        id: "w0",
+        name: "/mystack-warehouse-1",
+        image: "mystack-warehouse",
+        working_dir: Some(working_dir),
+        service: Some(service),
+        number: Some("1"),
+        ports: published(&["5432"]),
+        env: vec!["POSTGRES_USER=app", "POSTGRES_DB=warehouse"],
+    }
+}
+
+#[test]
+fn a_rendered_service_with_no_image_resolves_from_the_container_running_it() {
+    // The deferral #4 shipped with: a Compose service built from a local `Dockerfile`
+    // reports its image as `<name>-<service>`, so the Live Docker Strategy misses it
+    // entirely. The render says `warehouse` is a database — it targets 5432 and names
+    // `POSTGRES_*` — and the running container says everything the DSN is made of.
+    let host = ComposeHost::stack("/Users/b/AI/orders/infra", FX2)
+        .running(vec![built("/Users/b/AI/orders/infra", "warehouse")]);
+    let launch = launched(&host);
+    assert_eq!(launch.argv[1], "postgres://app@127.0.0.1:5432/warehouse");
+    assert_eq!(launch.title, "warehouse@5432 · compose · app");
+}
+
+/// A Project whose only Stack sits in `directory`, with the container running its
+/// `warehouse` service. What every discovery test varies is where that directory is.
+fn stack_at(directory: &'static str) -> ComposeHost {
+    ComposeHost::stack(directory, FX2).running(vec![built(directory, "warehouse")])
+}
+
+#[test]
+fn a_stack_is_found_anywhere_beneath_the_project_to_depth_three() {
+    // Compose files live wherever a repository puts them, and the root is only the
+    // commonest of those places. Depth is counted from the Project: `infra/` is 1 and
+    // `apps/api/` is 2, so three leaves a level of headroom over every layout seen.
+    for directory in [
+        "/Users/b/AI/orders",
+        "/Users/b/AI/orders/infra",
+        "/Users/b/AI/orders/docker",
+        "/Users/b/AI/orders/compose",
+        "/Users/b/AI/orders/apps/api",
+        "/Users/b/AI/orders/a/b/c",
+    ] {
+        assert!(
+            matches!(planned_against(&stack_at(directory)), Plan::Launch(_)),
+            "a Stack at {directory} was not found beneath the Project",
+        );
+    }
+
+    // And it is a budget rather than a search: a walk with no bound spends itself on a
+    // repository's build output long before it reaches anything.
+    let deeper = stack_at("/Users/b/AI/orders/a/b/c/d");
+    assert_eq!(
+        planned_against(&deeper),
+        found_nothing(),
+        "a Stack four levels beneath the Project was walked to",
+    );
+}
+
+#[test]
+fn a_stack_inside_a_skipped_directory_is_never_even_rendered() {
+    // A dependency tree is full of other people's compose files, and `target/` is full of
+    // copies of this repository's own. Neither is a database the Project offers, and
+    // rendering them costs a Compose invocation each.
+    for directory in [
+        "/Users/b/AI/orders/node_modules/pkg",
+        "/Users/b/AI/orders/vendor/thing",
+        "/Users/b/AI/orders/target/debug",
+        "/Users/b/AI/orders/dist/app",
+        "/Users/b/AI/orders/.git/modules",
+    ] {
+        let host = stack_at(directory);
+        assert_eq!(
+            planned_against(&host),
+            found_nothing(),
+            "a Stack at {directory} was resolved out of a directory that is skipped",
+        );
+        assert!(
+            host.rendered_in.borrow().is_empty(),
+            "{directory} was rendered anyway",
+        );
+    }
+}
+
+#[test]
+fn no_directory_symlink_is_followed_out_of_the_project() {
+    // A link into a sibling checkout is ordinary, and following it resolves that
+    // repository's database under this Project's name. Reached from a canonical root, a
+    // symlinked directory is exactly the one that resolves to somewhere else.
+    let host = stack_at("/Users/b/AI/orders/linked")
+        .linking("/Users/b/AI/orders/linked", Some("/Users/b/AI/elsewhere"));
+    assert_eq!(
+        planned_against(&host),
+        found_nothing(),
+        "a Stack behind a directory symlink was walked into",
+    );
+    assert!(
+        host.rendered_in.borrow().is_empty(),
+        "the linked directory was rendered anyway",
+    );
+}
+
+#[test]
+fn a_directory_holding_more_than_one_compose_filename_is_one_stack() {
+    // Compose applies its own precedence between the four names and merges nothing, so a
+    // directory holding two of them still resolves to one render. Taken as a Stack per
+    // filename it renders up to four times, and the same database arrives as `1 of 4`.
+    let host = ComposeHost::stack("/Users/b/AI/orders/infra", FX2)
+        .holding("/Users/b/AI/orders/infra/compose.yml")
+        .holding("/Users/b/AI/orders/infra/docker-compose.yaml")
+        .holding("/Users/b/AI/orders/infra/docker-compose.yml")
+        .running(vec![built("/Users/b/AI/orders/infra", "warehouse")]);
+    assert_eq!(launched(&host).title, "warehouse@5432 · compose · app");
+    assert_eq!(
+        *host.rendered_in.borrow(),
+        vec![PathBuf::from("/Users/b/AI/orders/infra")],
+        "the Stack was rendered other than exactly once, in its own directory",
+    );
+}
+
+/// Where the Stack sits in every test that is not about where Stacks sit.
+const INFRA: &str = "/Users/b/AI/orders/infra";
+
+#[test]
+fn the_render_supplies_the_identity_and_the_running_container_supplies_the_dsn() {
+    // ADR-0008, and the whole shape of this Strategy. The render says `warehouse` publishes
+    // 5432 and 15432 and that its password is `secret` — the latter resolved out of an
+    // `env_file:`, which is what makes it look like a credential. None of it may reach the
+    // DSN: a declared port connects to nothing when nothing is running it, and to something
+    // else when something is.
+    let host = ComposeHost::stack(INFRA, FX2).running(vec![Container {
+        ports: published(&["5544"]),
+        env: vec!["POSTGRES_USER=live", "POSTGRES_DB=orders"],
+        ..built(INFRA, "warehouse")
+    }]);
+    let dsn = resolved(&host);
+    assert_eq!(dsn, "postgres://live@127.0.0.1:5544/orders");
+    assert!(
+        !dsn.contains("secret"),
+        "the render's environment was read as a credential: {dsn}",
+    );
+}
+
+#[test]
+fn an_override_that_changes_the_published_port_resolves_to_what_the_container_publishes() {
+    // The base file declares `5432:5432`, the override declares `!override ["5434:5432"]`,
+    // and the application config in the same Stack still says 5432. Compose did that merge
+    // — nothing here parsed a `!override` — and the container is what settles the number
+    // either way, so the stale application config is never a port anything can reach.
+    let host = ComposeHost::stack(INFRA, FX1).running(vec![Container {
+        service: Some("db"),
+        number: Some("1"),
+        ports: published(&["5434"]),
+        env: vec!["POSTGRES_USER=app", "POSTGRES_DB=appdb"],
+        ..container()
+    }]);
+    assert_eq!(resolved(&host), "postgres://app@127.0.0.1:5434/appdb");
+}
+
+#[test]
+fn a_service_qualifies_on_its_image_or_its_declared_port_or_a_postgres_key() {
+    // The union is required and not belt-and-braces: a `build:` service renders with no
+    // `image` key at all, which is the case this Strategy exists for. Each fixture below
+    // says PostgreSQL through exactly one of the three and nothing through the other two.
+    // A false positive costs a wasted look at the containers, never a wrong database.
+    for (signal, render) in [
+        ("its image", IMAGE_ONLY),
+        ("a port targeting 5432", TARGET_ONLY),
+        // Compose writes an unset `${PGPASSWORD}` out as a key with an empty value, and a
+        // Stack that interpolates its credentials from the environment is precisely the
+        // kind that has to be identified. The key being named is the signal; reading the
+        // *value* the way a container's environment is read would drop the case.
+        ("an empty POSTGRES_USER", FX7),
+    ] {
+        let host = ComposeHost::stack(INFRA, render).running(vec![built(INFRA, "db")]);
+        assert!(
+            matches!(planned_against(&host), Plan::Launch(_)),
+            "a service identified by {signal} alone was not identified",
+        );
+    }
+}
+
+#[test]
+fn a_qualifying_service_with_nothing_running_it_is_not_a_candidate() {
+    // ADR-0008: a declaration is a statement of intent. With no container behind it there
+    // is no port to reach, no role and no password, and a Launch against the declared one
+    // is the confidently-wrong Pane this plugin exists to prevent. Telling the user which
+    // database is declared and stopped is #5's own Decline, not this.
+    assert_eq!(
+        planned_against(&ComposeHost::stack(INFRA, FX2)),
+        found_nothing(),
+        "a Stack with nothing running it produced a Candidate anyway",
+    );
+}
+
+#[test]
+fn a_service_that_says_nothing_about_postgres_is_not_a_database() {
+    // A Stack's other services are rendered alongside its database and some of them publish
+    // ports of their own. Launching a PostgreSQL client at Redis looks like the plugin
+    // resolved something, which is worse than declining.
+    let host = ComposeHost::stack(INFRA, CACHE_ONLY).running(vec![built(INFRA, "cache")]);
+    assert_eq!(
+        planned_against(&host),
+        found_nothing(),
+        "a Redis service with a container behind it was resolved as a database",
+    );
+}
+
+#[test]
+fn a_port_declared_without_a_binding_still_identifies_the_service() {
+    // `ports: ["5432"]` renders with no `published` key at all. The container side is what
+    // says "this is a PostgreSQL", and it is the only side of a declared port that is ever
+    // read — so a Stack that publishes nothing still resolves from whatever is running it.
+    let host = ComposeHost::stack(INFRA, FX5).running(vec![built(INFRA, "db")]);
+    assert_eq!(launched(&host).title, "warehouse@5432 · compose · app");
+}
+
+#[test]
+fn a_container_belongs_to_a_stack_only_when_it_names_that_stacks_own_directory_and_service() {
+    // Two Stacks in one Project may each have a service called `db`. Matched on being
+    // somewhere *under* the Project — the right test for attributing a container to a
+    // Project, and the wrong one here — the Launch lands in the other Stack's database
+    // under a title stating this one's.
+    for working_dir in [
+        "/Users/b/AI/orders",
+        "/Users/b/AI/orders/infra/nested",
+        "/Users/b/AI/orders/apps/api",
+    ] {
+        let host = ComposeHost::stack(INFRA, FX2).running(vec![Container {
+            working_dir: Some(working_dir),
+            ..built(INFRA, "warehouse")
+        }]);
+        assert_eq!(
+            planned_against(&host),
+            found_nothing(),
+            "a container brought up in {working_dir} was attributed to the Stack in {INFRA}",
+        );
+    }
+
+    // And the service is half of it: one Stack's `api` container is in the same directory
+    // as its `warehouse` one and is not the database.
+    for service in [Some("api"), None] {
+        let host = ComposeHost::stack(INFRA, FX2).running(vec![Container {
+            service,
+            ..built(INFRA, "warehouse")
+        }]);
+        assert_eq!(
+            planned_against(&host),
+            found_nothing(),
+            "a container labelled {service:?} was matched to the `warehouse` service",
+        );
+    }
+}
+
+#[test]
+fn both_sides_of_the_stack_directory_are_canonicalised_before_they_are_compared() {
+    // macOS reports the same directory as `/var/…` and as `/private/var/…`, and which of
+    // the two arrives depends on who said it: herdr names the Worktree, Compose names the
+    // directory it was run from. Canonicalising one side only makes the directory fail to
+    // equal itself, and every Stack in the Project stops resolving.
+    let host = ComposeHost::stack("/private/var/AI/orders/infra", FX2)
+        .running(vec![built("/var/AI/orders/infra", "warehouse")])
+        .linking("/var", Some("/private/var"));
+    assert!(
+        matches!(planned_for("/var/AI/orders", &host), Plan::Launch(_)),
+        "a Stack named through a symlink did not match its own container",
+    );
+}
+
+#[test]
+fn the_lowest_numbered_container_of_a_scaled_service_is_the_one_resolved() {
+    // `docker compose up --scale warehouse=10` gives one service ten containers with
+    // identical labels, and only one of them may be resolved: whichever Docker happened to
+    // list first differs run to run, and only consistent behaviour is learnable. The number
+    // is a string in the label map, so read as text the tenth replica precedes the second.
+    let host = ComposeHost::stack(INFRA, FX2).running(vec![
+        Container {
+            id: "w10",
+            name: "/mystack-warehouse-10",
+            number: Some("10"),
+            ports: published(&["5432"]),
+            env: vec!["POSTGRES_USER=app", "POSTGRES_DB=ten"],
+            ..built(INFRA, "warehouse")
+        },
+        Container {
+            id: "w2",
+            name: "/mystack-warehouse-2",
+            number: Some("2"),
+            ports: published(&["5433"]),
+            env: vec!["POSTGRES_USER=app", "POSTGRES_DB=two"],
+            ..built(INFRA, "warehouse")
+        },
+    ]);
+    assert_eq!(resolved(&host), "postgres://app@127.0.0.1:5433/two");
+
+    // A container carrying no number at all sorts last rather than disqualifying itself:
+    // it is still a container running the service, and something is better resolved than
+    // nothing.
+    let host = ComposeHost::stack(INFRA, FX2).running(vec![
+        Container {
+            id: "wx",
+            name: "/mystack-warehouse-x",
+            number: None,
+            ports: published(&["5432"]),
+            env: vec!["POSTGRES_USER=app", "POSTGRES_DB=unnumbered"],
+            ..built(INFRA, "warehouse")
+        },
+        Container {
+            id: "w2",
+            name: "/mystack-warehouse-2",
+            number: Some("2"),
+            ports: published(&["5433"]),
+            env: vec!["POSTGRES_USER=app", "POSTGRES_DB=two"],
+            ..built(INFRA, "warehouse")
+        },
+    ]);
+    assert_eq!(resolved(&host), "postgres://app@127.0.0.1:5433/two");
+}
+
+#[test]
+fn a_service_publishing_two_host_ports_for_5432_is_one_candidate_on_the_lowest() {
+    // The same rule the Live Docker Strategy applies, applied by the same code: two
+    // Strategies that read one container differently produce two Candidates that no
+    // deduplication can then reconcile. One database, one Candidate, on the lower port.
+    let host = ComposeHost::stack(INFRA, FX2).running(vec![Container {
+        ports: published(&["15432", "5432"]),
+        ..built(INFRA, "warehouse")
+    }]);
+    assert_eq!(launched(&host).title, "warehouse@5432 · compose · app");
+}
+
+#[test]
+fn a_stack_that_will_not_render_is_silent_and_does_not_stop_the_others() {
+    // An unset `${VAR:?}` in one Stack is not the Project failing to resolve. Compose exits
+    // 1 with an empty stdout and its reason on stderr — an answer, not an absence — and a
+    // `?` that propagated out of the loop would abandon every other Stack in the Project.
+    let host = ComposeHost::stack(INFRA, FX2)
+        .holding("/Users/b/AI/orders/broken/compose.yaml")
+        .rendering("/Users/b/AI/orders/broken", Render::Refuses)
+        .running(vec![built(INFRA, "warehouse")]);
+    assert_eq!(launched(&host).title, "warehouse@5432 · compose · app");
+    assert_eq!(
+        host.rendered_in.borrow().len(),
+        2,
+        "a Stack that refused to render stopped the others being tried",
+    );
+
+    // And on its own it is nothing found rather than a fault of the Project's: what the
+    // user is told is what they can act on, not what Compose's stderr happened to say.
+    for render in [Render::Refuses, Render::Absent] {
+        let host = ComposeHost::empty()
+            .holding("/Users/b/AI/orders/broken/compose.yaml")
+            .rendering("/Users/b/AI/orders/broken", render);
+        assert_eq!(planned_against(&host), found_nothing());
+    }
+}
+
+#[test]
+fn never_panics_whatever_compose_says() {
+    // The render is another program's output, versioned by that program. A panic in a Pane
+    // is a crash the user watches happen (ADR-0004), so a render this plugin cannot read is
+    // one it declines on.
+    for said in [
+        "",
+        "not json at all",
+        "{}",
+        "[]",
+        r#"{"services":null}"#,
+        r#"{"services":[]}"#,
+        r#"{"services":{"warehouse":null}}"#,
+        r#"{"services":{"warehouse":{"image":42}}}"#,
+        r#"{"services":{"warehouse":{"ports":"5432"}}}"#,
+        r#"{"services":{"warehouse":{"ports":[{"target":"5432"}]}}}"#,
+        r#"{"services":{"warehouse":{"ports":[null]}}}"#,
+        r#"{"services":{"warehouse":{"environment":["POSTGRES_DB=x"]}}}"#,
+    ] {
+        let host = ComposeHost::stack(INFRA, said).running(vec![built(INFRA, "warehouse")]);
+        assert_eq!(
+            planned_against(&host),
+            found_nothing(),
+            "the render {said} was not declined on",
+        );
+    }
 }
 
 /// A verified trap, not a style preference (ADR-0004).

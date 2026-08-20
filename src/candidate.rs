@@ -8,13 +8,19 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Origin {
     Docker,
+    Compose,
 }
 
 impl Origin {
     /// The one word the title uses for this origin.
+    ///
+    /// `compose` is the rendered read, where Compose itself resolved the Stack. The
+    /// approximate read that follows when the render will not run takes `compose~`, so the
+    /// two are never confusable on screen and neither has to rename the other.
     pub fn label(&self) -> &'static str {
         match self {
             Self::Docker => "docker",
+            Self::Compose => "compose",
         }
     }
 }

@@ -15,20 +15,47 @@ use crate::host::Host;
 /// needs present. Absent, it is a Strategy that finds nothing rather than a fault.
 const PROGRAM: &str = "docker";
 
+/// One running container: the id `docker ps` listed it under, and the object
+/// `docker inspect` answered with.
+pub struct Inspected {
+    pub id: String,
+    pub json: serde_json::Value,
+}
+
+/// Every container Docker reports as running, inspected. Swept once per Plan and read by
+/// every Strategy that needs to know what is alive: two sweeps could disagree about the
+/// same machine, and a Candidate deduplicated against a container the other Strategy never
+/// saw is a Candidate deduplicated against nothing.
+pub fn sweep(project: &Path, host: &dyn Host) -> Vec<Inspected> {
+    running(project, host)
+        .iter()
+        .filter_map(|id| {
+            let inspected = host.run(PROGRAM, &["inspect", id], project)?;
+            if inspected.status != 0 {
+                return None;
+            }
+            let said: serde_json::Value = serde_json::from_str(&inspected.stdout).ok()?;
+            // `docker inspect` answers with an array of one; unwrapped here so that every
+            // reader of a sweep sees a container rather than a list holding one.
+            Some(Inspected {
+                id: id.clone(),
+                json: said.get(0)?.clone(),
+            })
+        })
+        .collect()
+}
+
 /// The Candidates the running containers of this machine offer `project`.
-pub fn candidates(project: &Path, host: &dyn Host) -> Vec<Candidate> {
+pub fn candidates(project: &Path, host: &dyn Host, sweep: &[Inspected]) -> Vec<Candidate> {
     // Once, before anything is compared: the Project arrives as herdr names it, and the
     // labels arrive as Compose recorded them, and on macOS the same directory is `/var/…`
     // to one and `/private/var/…` to the other.
     let Some(project_root) = host.canonicalize(project) else {
         return Vec::new();
     };
-    let mut found: Vec<Candidate> = running(project, host)
+    let mut found: Vec<Candidate> = sweep
         .iter()
-        .filter_map(|id| host.run(PROGRAM, &["inspect", id], project))
-        .filter(|inspected| inspected.status == 0)
-        .filter_map(|inspected| serde_json::from_str::<serde_json::Value>(&inspected.stdout).ok())
-        .filter_map(|inspected| candidate(inspected.get(0)?, &project_root, host))
+        .filter_map(|inspected| candidate(&inspected.json, &project_root, host))
         .collect();
     // `docker ps` lists in whichever order it lists, and the rank the title states must not
     // be one of them: only consistent behaviour is learnable, so a Project resolves to the
@@ -64,13 +91,13 @@ fn running(project: &Path, host: &dyn Host) -> Vec<String> {
 /// "postgres" and is not a database — it is refused by publishing 3000 rather than 5432,
 /// so tightening this filter would buy nothing and would drop distributions that name
 /// themselves in ways nobody has thought of yet.
-const IMAGES: [&str; 4] = ["postgres", "pgvector", "timescale", "supabase"];
+pub(crate) const IMAGES: [&str; 4] = ["postgres", "pgvector", "timescale", "supabase"];
 
 /// The label Compose stamps every container it brings up with, naming the directory the
 /// compose file was run from. The one thing that attributes a container to a Project: a
 /// container without it cannot be attributed to any Project at all, and guessing which one
 /// owns it is how the wrong database gets edited.
-const COMPOSE_WORKING_DIR: &str = "com.docker.compose.project.working_dir";
+pub(crate) const COMPOSE_WORKING_DIR: &str = "com.docker.compose.project.working_dir";
 
 /// The role the official image starts as when nothing names one.
 const DEFAULT_ROLE: &str = "postgres";
@@ -98,6 +125,17 @@ fn candidate(
     if !working_dir.starts_with(project_root) {
         return None;
     }
+    connection(inspected, Origin::Docker)
+}
+
+/// One running container as the connection it offers, whichever Strategy vouched for it, or
+/// `None` when nothing on the host can reach its PostgreSQL.
+///
+/// Shared rather than written twice: both Strategies can vouch for the same container, and
+/// two readings of one container that disagreed about its port or its role would produce two
+/// Candidates that no deduplication could then reconcile (ADR-0008).
+pub(crate) fn connection(inspected: &serde_json::Value, origin: Origin) -> Option<Candidate> {
+    let config = inspected.get("Config")?;
     // The image's own defaults, because they are what the container that is running did:
     // an unset `POSTGRES_USER` started it as `postgres`, and an unset `POSTGRES_DB` gave it
     // a database named after whichever role that resolved to. An unset `POSTGRES_PASSWORD`
@@ -105,7 +143,7 @@ fn candidate(
     // that is refused.
     let role = setting(config, "POSTGRES_USER").unwrap_or(DEFAULT_ROLE);
     Some(Candidate {
-        origin: Origin::Docker,
+        origin,
         database: setting(config, "POSTGRES_DB").unwrap_or(role).to_string(),
         role: role.to_string(),
         password: setting(config, "POSTGRES_PASSWORD").map(str::to_string),

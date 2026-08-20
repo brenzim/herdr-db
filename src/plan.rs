@@ -4,6 +4,7 @@
 use std::path::PathBuf;
 
 use crate::client;
+use crate::compose;
 use crate::context::{InvocationContext, RawContext};
 use crate::docker;
 use crate::host::Host;
@@ -50,7 +51,12 @@ pub fn plan(context: &InvocationContext, host: &dyn Host) -> Plan {
     let Some(project) = parsed.project() else {
         return Plan::Decline(Diagnosis::NoProjectIdentified);
     };
-    let candidates = docker::candidates(&project, host);
+    // One sweep of what is running, read by every Strategy that needs it: two sweeps could
+    // disagree about the same machine, and a Strategy's opinion is only comparable with
+    // another's when both were formed from the same containers.
+    let sweep = docker::sweep(&project, host);
+    let mut candidates = docker::candidates(&project, host, &sweep);
+    candidates.extend(compose::candidates(&project, host, &sweep));
     let of = candidates.len();
     // A Strategy that found nothing is not a fault of its own: Docker being absent looks
     // from here exactly like Docker running nothing, and both leave the chain to go on.
