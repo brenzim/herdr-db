@@ -41,6 +41,7 @@ pub enum Overridden {
 pub struct Override {
     pub dsn: String,
     pub label: String,
+    pub read_only: bool,
 }
 
 impl Overrides {
@@ -129,9 +130,27 @@ fn stated(pinned: &toml::Value) -> Overridden {
         (Some(addressed), Some(label)) => Overridden::Pinned(Override {
             dsn: addressed.to_string(),
             label: label.to_string(),
+            read_only: read_only(pinned),
         }),
         _ => Overridden::Silent,
     }
+}
+
+/// Whether the connection opens read-only, which it does unless the entry says outright that
+/// it does not.
+///
+/// The default is inverted from every discovered Candidate's (`docker.rs`), and the asymmetry
+/// is the point: a local container is something an agent just wrote and spot-editing it is
+/// what the plugin is for, whereas an Override is by construction the route to something the
+/// Strategies refuse to infer, which correlates with "someone else may be using this"
+/// (ADR-0005). So everything that is not the boolean `false` — a missing key, a key of the
+/// wrong type, a `read_only = "false"` written as a string — falls to read-only. Falling the
+/// other way would make one typo a silent write-enable on a shared database.
+fn read_only(pinned: &toml::Value) -> bool {
+    pinned
+        .get("read_only")
+        .and_then(toml::Value::as_bool)
+        .unwrap_or(true)
 }
 
 impl Override {

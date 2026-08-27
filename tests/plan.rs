@@ -978,9 +978,15 @@ fn a_local_candidate_opens_read_write() {
     // ADR-0005: spot-editing what an agent just wrote is the point of a local database.
     // Read-only is the Override's default instead, because an Override is by construction
     // the route to something someone else may be using.
+    let launch = launched(&DockerHost::running(vec![container()]));
     assert!(
-        !launched(&DockerHost::running(vec![container()])).read_only,
+        !launch.read_only,
         "a container on this machine was opened read-only",
+    );
+    assert!(
+        !launch.argv.contains(&"-read-only".to_string()),
+        "the Client was launched read-only against a local container: {:?}",
+        launch.argv,
     );
 }
 
@@ -2135,6 +2141,11 @@ fn pinning(key: &str) -> String {
     format!("[projects.\"{key}\"]\ndsn = \"{REMOTE}\"\nlabel = \"orders staging\"\n")
 }
 
+/// The same Override, saying `also` about the connection as well.
+fn pinning_and(key: &str, also: &str) -> String {
+    format!("{}{also}\n", pinning(key))
+}
+
 #[test]
 fn an_override_pins_the_project_to_its_own_dsn_verbatim() {
     // The escape hatch: the user wrote the connection down, so it is used exactly as
@@ -2147,7 +2158,9 @@ fn an_override_pins_the_project_to_its_own_dsn_verbatim() {
     else {
         panic!("an Override naming this Project did not launch");
     };
-    assert_eq!(launch.argv[1], REMOTE);
+    // The DSN is the Client's positional argument, so it is the last thing on the line
+    // whatever flags precede it.
+    assert_eq!(launch.argv.last().unwrap(), REMOTE);
 }
 
 #[test]
@@ -2177,7 +2190,7 @@ fn an_override_wins_over_a_running_candidate() {
     else {
         panic!("an Override lost to a discovered Candidate");
     };
-    assert_eq!(launch.argv[1], REMOTE);
+    assert_eq!(launch.argv.last().unwrap(), REMOTE);
     assert_eq!(launch.title, "orders staging · override");
 }
 
@@ -2266,6 +2279,64 @@ fn an_override_for_a_directory_this_machine_does_not_have_still_pins_it() {
             Plan::Launch(_),
         ),
         "an Override was dropped because its Project directory does not resolve",
+    );
+}
+
+#[test]
+fn an_override_that_says_nothing_about_writing_opens_read_only() {
+    // The default is inverted from every other source, and deliberately so (ADR-0005): an
+    // Override is by construction the route to something the Strategies refuse to infer,
+    // which correlates with "someone else may be using this". The flag has to reach the
+    // Client for the default to mean anything (AC 18).
+    let host = Overriding::at(OVERRIDES, pinning(PROJECT), &SilentHost);
+    let Plan::Launch(launch) =
+        planned_with(PROJECT, &Overrides::at(Some(Path::new(CONFIG))), &host)
+    else {
+        panic!("an Override naming this Project did not launch");
+    };
+    assert!(launch.read_only, "an Override opened read-write by default");
+    assert_eq!(launch.argv, ["lazysql", "-read-only", REMOTE]);
+}
+
+#[test]
+fn an_override_saying_read_only_is_false_opens_read_write() {
+    // The user's own machine, the user's own statement: an escape hatch that could not be
+    // written through would send them back to a terminal for every edit (AC 19).
+    let host = Overriding::at(
+        OVERRIDES,
+        pinning_and(PROJECT, "read_only = false"),
+        &SilentHost,
+    );
+    let Plan::Launch(launch) =
+        planned_with(PROJECT, &Overrides::at(Some(Path::new(CONFIG))), &host)
+    else {
+        panic!("an Override naming this Project did not launch");
+    };
+    assert!(
+        !launch.read_only,
+        "an explicit read_only = false was not honoured",
+    );
+    assert_eq!(launch.argv, ["lazysql", REMOTE]);
+}
+
+#[test]
+fn a_read_only_of_the_wrong_type_leaves_the_override_read_only() {
+    // `read_only = "false"` is a string, and the direction it falls in is the whole question:
+    // one typo away from the safe default is a silent write-enable on a database someone else
+    // may be using. Only `read_only = false` opens writing.
+    let host = Overriding::at(
+        OVERRIDES,
+        pinning_and(PROJECT, "read_only = \"false\""),
+        &SilentHost,
+    );
+    let Plan::Launch(launch) =
+        planned_with(PROJECT, &Overrides::at(Some(Path::new(CONFIG))), &host)
+    else {
+        panic!("an Override naming this Project did not launch");
+    };
+    assert!(
+        launch.read_only,
+        "a wrong-typed read_only opened the database for writing",
     );
 }
 

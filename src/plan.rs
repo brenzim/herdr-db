@@ -63,11 +63,9 @@ pub fn plan(context: &InvocationContext, overrides: &Overrides, host: &dyn Host)
     };
     if let Overridden::Pinned(pinned) = overrides.pinning(&project, host) {
         return Plan::Launch(Launch {
-            argv: client::argv(&pinned.dsn),
+            argv: client::argv(&pinned.dsn, pinned.read_only),
             title: pinned.title(),
-            // An Override is by construction the route to something the Strategies refuse to
-            // infer, which correlates with "someone else may be using this" (ADR-0005).
-            read_only: true,
+            read_only: pinned.read_only,
         });
     }
     let sweep = docker::sweep(&project, host);
@@ -90,7 +88,7 @@ pub fn plan(context: &InvocationContext, overrides: &Overrides, host: &dyn Host)
         return Plan::Decline(Diagnosis::NoConnectionFound { project });
     };
     Plan::Launch(Launch {
-        argv: client::argv(&candidate.dsn()),
+        argv: client::argv(&candidate.dsn(), candidate.read_only),
         title: candidate.title(of),
         read_only: candidate.read_only,
     })
