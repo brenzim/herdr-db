@@ -10,6 +10,7 @@ use crate::compose::{self, Stopped};
 use crate::context::{InvocationContext, RawContext};
 use crate::docker;
 use crate::host::Host;
+use crate::overrides::{Overridden, Overrides};
 
 /// The outcome of Connection Resolution.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,7 +46,7 @@ pub enum Diagnosis {
 
 /// Turns what herdr said, plus the world, into a Plan. Never panics: every fault is a
 /// `Decline` the Pane can show (ADR-0004).
-pub fn plan(context: &InvocationContext, host: &dyn Host) -> Plan {
+pub fn plan(context: &InvocationContext, overrides: &Overrides, host: &dyn Host) -> Plan {
     let Some(raw) = context.raw() else {
         return Plan::Decline(Diagnosis::ContextMissing);
     };
@@ -60,6 +61,15 @@ pub fn plan(context: &InvocationContext, host: &dyn Host) -> Plan {
     let Some(project) = parsed.project() else {
         return Plan::Decline(Diagnosis::NoProjectIdentified);
     };
+    if let Overridden::Pinned(pinned) = overrides.pinning(&project, host) {
+        return Plan::Launch(Launch {
+            argv: client::argv(&pinned.dsn),
+            title: pinned.title(),
+            // An Override is by construction the route to something the Strategies refuse to
+            // infer, which correlates with "someone else may be using this" (ADR-0005).
+            read_only: true,
+        });
+    }
     let sweep = docker::sweep(&project, host);
     let rendered = compose::candidates(&project, host, &sweep);
     let mut candidates = docker::candidates(&project, host, &sweep);

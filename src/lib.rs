@@ -9,5 +9,6 @@ pub mod context;
 pub mod diagnosis;
 pub mod docker;
 pub mod host;
+pub mod overrides;
 pub mod pane;
 pub mod plan;
