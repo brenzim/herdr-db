@@ -2153,6 +2153,12 @@ fn pinning_and(key: &str, also: &str) -> String {
     format!("{}{also}\n", pinning(key))
 }
 
+/// An Override file that is not TOML: the DSN's string is never closed. The fault is on the
+/// credential-bearing line deliberately — that is the line a parser error quotes back.
+fn malformed(key: &str) -> String {
+    format!("[projects.\"{key}\"]\ndsn = \"{REMOTE}\nlabel = \"orders staging\"\n")
+}
+
 #[test]
 fn an_override_pins_the_project_to_its_own_dsn_verbatim() {
     // The escape hatch: the user wrote the connection down, so it is used exactly as
@@ -2416,6 +2422,95 @@ fn an_override_file_naming_other_projects_says_nothing_about_this_one() {
     // says is about somewhere else. Reading it must leave this Project exactly where an
     // absent file would: back on the chain, and declining as if nothing had been read.
     let host = Overriding::at(OVERRIDES, pinning("/Users/b/AI/billing"), &SilentHost);
+    assert_eq!(
+        planned_with(PROJECT, &Overrides::at(Some(Path::new(CONFIG))), &host),
+        found_nothing(),
+    );
+}
+
+#[test]
+fn a_malformed_override_file_declines_and_names_the_file() {
+    // The file is the user's own, hand-written, and the only thing they can fix. Ignoring a
+    // typo in it leaves the escape hatch silently shut with nothing on screen to say why
+    // (AC 24), so the fault is shown and the file is named so it can be opened.
+    let host = Overriding::at(OVERRIDES, malformed(PROJECT), &SilentHost);
+    let Plan::Decline(diagnosis) =
+        planned_with(PROJECT, &Overrides::at(Some(Path::new(CONFIG))), &host)
+    else {
+        panic!("a malformed Override file was ignored rather than diagnosed");
+    };
+    assert_eq!(
+        diagnosis,
+        Diagnosis::OverrideUnreadable {
+            file: PathBuf::from(OVERRIDES),
+        },
+    );
+    assert!(
+        diagnosis.message().contains(OVERRIDES),
+        "the Decline never names the file to go and fix: {}",
+        diagnosis.message(),
+    );
+}
+
+#[test]
+fn a_malformed_override_file_quotes_none_of_its_own_contents() {
+    // A TOML parser's error quotes the line it failed on, and here that line is the DSN.
+    // Every DSN is redacted wherever it is displayed (AC 9, ADR-0005), and a Decline is on
+    // screen for as long as the Pane is — so the diagnosis carries the path and nothing
+    // else. `tests/redaction.rs` scans source and cannot see this one.
+    let host = Overriding::at(OVERRIDES, malformed(PROJECT), &SilentHost);
+    let Plan::Decline(diagnosis) =
+        planned_with(PROJECT, &Overrides::at(Some(Path::new(CONFIG))), &host)
+    else {
+        panic!("a malformed Override file was ignored rather than diagnosed");
+    };
+    let message = diagnosis.message();
+    for secret in [REMOTE, "secret", "db.staging.internal", "orders staging"] {
+        assert!(
+            !message.contains(secret),
+            "the Decline echoes `{secret}` out of the Override file: {message}",
+        );
+    }
+}
+
+#[test]
+fn a_malformed_override_file_is_not_resolved_around() {
+    // There is a running database this Project would otherwise resolve to. Falling through
+    // to it would open a Pane the user believes is their Override and is not — the one
+    // outcome worse than declining, because nothing on screen would be wrong.
+    let world = DockerHost::running(vec![container()]);
+    let host = Overriding::at(OVERRIDES, malformed(PROJECT), &world);
+    assert!(
+        matches!(
+            planned_with(PROJECT, &Overrides::at(Some(Path::new(CONFIG))), &host),
+            Plan::Decline(Diagnosis::OverrideUnreadable { .. }),
+        ),
+        "a broken Override file fell through to a Candidate the user never asked for",
+    );
+}
+
+#[test]
+fn an_empty_override_file_says_nothing_and_is_not_a_fault() {
+    // An empty file is valid TOML declaring nothing — the state a user is in the moment
+    // they create the file. Declining on it would make an unpinned Project unresolvable.
+    let host = Overriding::at(OVERRIDES, String::new(), &SilentHost);
+    assert_eq!(
+        planned_with(PROJECT, &Overrides::at(Some(Path::new(CONFIG))), &host),
+        found_nothing(),
+    );
+}
+
+#[test]
+fn an_override_file_that_cannot_be_read_at_all_says_nothing() {
+    // `Host::read_file` answers `None` if it cannot be read for any reason, so an absent
+    // file and one the user has no permission to open arrive here identically. Only "the
+    // bytes were read and are not TOML" is a fault the user can be told anything useful
+    // about; the rest is the ordinary state of a machine with no Override file on it.
+    let host = Overriding::at(
+        "/Users/b/elsewhere/overrides.toml",
+        pinning(PROJECT),
+        &SilentHost,
+    );
     assert_eq!(
         planned_with(PROJECT, &Overrides::at(Some(Path::new(CONFIG))), &host),
         found_nothing(),

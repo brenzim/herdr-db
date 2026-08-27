@@ -39,6 +39,11 @@ pub enum Diagnosis {
     DeclaredButNotRunning {
         stopped: Vec<Stopped>,
     },
+    /// The Override file was read and is not TOML. Names the file and quotes none of it:
+    /// the line a parser would point at is the line the credentials are on (ADR-0005).
+    OverrideUnreadable {
+        file: PathBuf,
+    },
     NoConnectionFound {
         project: PathBuf,
     },
@@ -61,12 +66,21 @@ pub fn plan(context: &InvocationContext, overrides: &Overrides, host: &dyn Host)
     let Some(project) = parsed.project() else {
         return Plan::Decline(Diagnosis::NoProjectIdentified);
     };
-    if let Overridden::Pinned(pinned) = overrides.pinning(&project, host) {
-        return Plan::Launch(Launch {
-            argv: client::argv(&pinned.dsn, pinned.read_only),
-            title: pinned.title(),
-            read_only: pinned.read_only,
-        });
+    match overrides.pinning(&project, host) {
+        Overridden::Pinned(pinned) => {
+            return Plan::Launch(Launch {
+                argv: client::argv(&pinned.dsn, pinned.read_only),
+                title: pinned.title(),
+                read_only: pinned.read_only,
+            });
+        }
+        // Declining rather than going on down the chain: the user wrote the file to be
+        // used, and a Pane they believe is their Override but is a Candidate resolved
+        // around it is the one outcome with nothing wrong on screen to notice.
+        Overridden::Unreadable { file } => {
+            return Plan::Decline(Diagnosis::OverrideUnreadable { file });
+        }
+        Overridden::Silent => {}
     }
     let sweep = docker::sweep(&project, host);
     let rendered = compose::candidates(&project, host, &sweep);
@@ -185,6 +199,12 @@ impl Diagnosis {
                 };
                 format!("{opening}{}", listed(stopped))
             }
+            Self::OverrideUnreadable { file } => format!(
+                "the Override file at {} is not valid TOML, so nothing in it could be \
+                 read. Fix the file and retry; nothing of what it says is repeated here, \
+                 because it holds credentials.",
+                file.display(),
+            ),
             Self::NoConnectionFound { project } => format!(
                 "no database connection was found for the Project at {}.",
                 project.display(),

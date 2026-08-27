@@ -34,6 +34,12 @@ pub enum Overridden {
     /// No config directory, no file, or a file naming no Override for this Project.
     Silent,
     Pinned(Override),
+    /// The file was read and is not TOML. Carries the path and nothing out of the file: a
+    /// parser's own error quotes the line it failed on, which here is the line the
+    /// credentials are written on (ADR-0005).
+    Unreadable {
+        file: PathBuf,
+    },
 }
 
 /// One connection a user pinned to a Project.
@@ -75,11 +81,17 @@ impl Overrides {
         let Some(directory) = &self.directory else {
             return Overridden::Silent;
         };
-        let Some(raw) = host.read_file(&directory.join(FILE)) else {
+        let file = directory.join(FILE);
+        // A file that cannot be read at all is not a fault: `Host::read_file` answers
+        // `None` for any reason, so an absent file — the ordinary state of a machine with
+        // no Override on it — and one that could not be opened arrive here identically, and
+        // there is nothing to tell the user apart from the two. Only bytes that were read
+        // and are not TOML is something they can go and fix.
+        let Some(raw) = host.read_file(&file) else {
             return Overridden::Silent;
         };
         let Ok(parsed) = toml::from_str::<toml::Value>(&raw) else {
-            return Overridden::Silent;
+            return Overridden::Unreadable { file };
         };
         let Some(projects) = parsed.get(PROJECTS).and_then(toml::Value::as_table) else {
             return Overridden::Silent;

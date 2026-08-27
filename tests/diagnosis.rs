@@ -28,6 +28,9 @@ fn every_diagnosis() -> Vec<Diagnosis> {
                 directory: PathBuf::from("/Users/b/AI/herdr-db/infra"),
             }],
         },
+        Diagnosis::OverrideUnreadable {
+            file: PathBuf::from("/Users/b/.config/herdr/plugins/db/overrides.toml"),
+        },
         Diagnosis::NoConnectionFound {
             project: PathBuf::from(PROJECT),
         },
