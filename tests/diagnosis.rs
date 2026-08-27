@@ -31,6 +31,9 @@ fn every_diagnosis() -> Vec<Diagnosis> {
         Diagnosis::OverrideUnreadable {
             file: PathBuf::from("/Users/b/.config/herdr/plugins/db/overrides.toml"),
         },
+        Diagnosis::OverrideIncomplete {
+            file: PathBuf::from("/Users/b/.config/herdr/plugins/db/overrides.toml"),
+        },
         Diagnosis::NoConnectionFound {
             project: PathBuf::from(PROJECT),
         },

@@ -40,6 +40,13 @@ pub enum Overridden {
     Unreadable {
         file: PathBuf,
     },
+    /// The file parses and names this Project, and the entry carries no connection — a
+    /// misspelled or missing `dsn`/`label`, or an entry that is not a table at all. Carries
+    /// the path only, on the same ground as `Unreadable`: the entry holds the DSN whatever
+    /// else it is missing.
+    Incomplete {
+        file: PathBuf,
+    },
 }
 
 /// One connection a user pinned to a Project.
@@ -96,9 +103,13 @@ impl Overrides {
         let Some(projects) = parsed.get(PROJECTS).and_then(toml::Value::as_table) else {
             return Overridden::Silent;
         };
-        keyed(projects, project, host)
-            .and_then(stated)
-            .map_or(Overridden::Silent, Overridden::Pinned)
+        // An entry naming this Project is the user saying they pinned it, so from here the
+        // file either yields a connection or the Project declines: falling back to the chain
+        // would resolve a Candidate around an Override the user believes is in force.
+        let Some(entry) = keyed(projects, project, host) else {
+            return Overridden::Silent;
+        };
+        stated(entry).map_or(Overridden::Incomplete { file }, Overridden::Pinned)
     }
 }
 
@@ -130,9 +141,10 @@ fn keyed<'a>(
 
 /// One entry of the `projects` table as an Override, or `None` if it does not carry one.
 ///
-/// Both fields are required, and an entry missing either says nothing rather than taking the
-/// rest of the file down with it: a connection with no label cannot be announced, and
-/// announcing which database is open is what makes the Pane safe to work in (ADR-0006).
+/// Both fields are required: a connection with no label cannot be announced, and announcing
+/// which database is open is what makes the Pane safe to work in (ADR-0006). An entry missing
+/// either is a fault of that entry alone — the rest of the file is read as written, and only
+/// the Project this entry names declines.
 fn stated(pinned: &toml::Value) -> Option<Override> {
     Some(Override {
         dsn: pinned.get("dsn").and_then(toml::Value::as_str)?.to_string(),

@@ -13,9 +13,14 @@ testing effort concentrates on resolution, which is the part that is actually sp
 The Client becomes a dependency we must detect, not vendor: the install-time build step
 fails when it is absent from `PATH`.
 
-Detection is presence only — there is no minimum-version check. The integration surface is a
-single positional DSN ([ADR-0002](./0002-lazysql-as-the-client.md)), which every released
-lazysql has accepted, so there is no version-sensitive behaviour to guard and no floor worth
-naming. The trigger to revisit is the plugin coming to depend on a flag or behaviour that
-arrived in a particular release — `-read-only` being the first candidate — at which point the
-build step gains a version check rather than the plugin gaining a runtime fallback.
+Detection was presence only until the plugin came to depend on `-read-only`, which
+[ADR-0005](./0005-overrides-are-machine-local-and-the-only-route-off-localhost.md) makes the
+default for every Override. That was the trigger this ADR named, and the remedy is the one it
+named too: the build step checks at install time rather than the plugin gaining a runtime
+fallback — a Pane has already `exec`ed the Client and cannot diagnose it.
+
+The check asks the Client which options it has, rather than comparing a version number against
+a floor. The flag is the fact that matters, a release that renames or renumbers itself still
+answers it, and no release history has to be tracked here. Because the Client's usage text is
+not a contract, the check refuses only on a positive answer — options listed, this one absent —
+and treats silence or an unfamiliar format as unconfirmable and installs anyway.

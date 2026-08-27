@@ -57,6 +57,12 @@ pub enum Diagnosis {
     OverrideUnreadable {
         file: PathBuf,
     },
+    /// The Override file names this Project and the entry carries no connection. Names the
+    /// file and the keys an Override needs, and quotes nothing: the entry holds a DSN
+    /// whatever else it is missing (ADR-0005).
+    OverrideIncomplete {
+        file: PathBuf,
+    },
     NoConnectionFound {
         project: PathBuf,
     },
@@ -88,6 +94,11 @@ pub fn plan(context: &InvocationContext, overrides: &Overrides, host: &dyn Host)
         // around it is the one outcome with nothing wrong on screen to notice.
         Overridden::Unreadable { file } => {
             return Plan::Decline(Diagnosis::OverrideUnreadable { file });
+        }
+        // Same reason, one level in: the file named this Project, so the user is pinned
+        // whether or not the plugin could read what they pinned it to.
+        Overridden::Incomplete { file } => {
+            return Plan::Decline(Diagnosis::OverrideIncomplete { file });
         }
         Overridden::Silent => {}
     }
@@ -212,6 +223,13 @@ impl Diagnosis {
                 "the Override file at {} is not valid TOML, so nothing in it could be \
                  read. Fix the file and retry; nothing of what it says is repeated here, \
                  because it holds credentials.",
+                file.display(),
+            ),
+            Self::OverrideIncomplete { file } => format!(
+                "the Override file at {} pins this Project, but the entry carries no \
+                 connection: an Override needs a `dsn` and a `label`, spelled exactly so. \
+                 Fix the entry and retry; nothing of what it says is repeated here, because \
+                 it holds credentials.",
                 file.display(),
             ),
             Self::NoConnectionFound { project } => format!(

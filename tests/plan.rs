@@ -2168,6 +2168,18 @@ fn malformed() -> String {
     format!("[projects.\"{PROJECT}\"]\ndsn = \"{REMOTE}\nlabel = \"orders staging\"\n")
 }
 
+/// An Override file that parses and names this Project, whose entry carries no connection:
+/// `label` is misspelled. Valid TOML, so no parse error fires — and nothing usable is there.
+fn mistyped() -> String {
+    format!("[projects.\"{PROJECT}\"]\ndsn = \"{REMOTE}\"\nlable = \"orders staging\"\n")
+}
+
+/// The same shape one level flatter: the Project's key holds the DSN itself rather than a
+/// table, which is how a user writes it before reading the file's documentation.
+fn keyed_to_a_bare_string() -> String {
+    format!("[projects]\n\"{PROJECT}\" = \"{REMOTE}\"\n")
+}
+
 /// An Override file at the one path the plugin looks in, with nothing behind it.
 fn overriding(contents: String) -> Overriding<'static> {
     Overriding::at(OVERRIDES, contents, &SilentHost)
@@ -2469,6 +2481,74 @@ fn a_malformed_override_file_is_not_resolved_around() {
         ),
         "a broken Override file fell through to a Candidate the user never asked for",
     );
+}
+
+#[test]
+fn an_override_entry_carrying_no_connection_declines_and_names_the_file() {
+    // A misspelled key keeps the file valid TOML, so nothing above catches it. The entry
+    // still names this Project, which is the user stating they pinned it — so the escape
+    // hatch is either honoured or its failure is shown (AC 24). Resolving on down the chain
+    // would open a local container, read-write, under a title claiming nothing is wrong.
+    let host = overriding(mistyped());
+    let diagnosis = declined_overriding(&host);
+    assert_eq!(
+        diagnosis,
+        Diagnosis::OverrideIncomplete {
+            file: PathBuf::from(OVERRIDES),
+        },
+    );
+    assert!(
+        diagnosis.message().contains(OVERRIDES),
+        "the Decline never names the file to go and fix: {}",
+        diagnosis.message(),
+    );
+}
+
+#[test]
+fn an_override_entry_that_is_not_a_table_declines_the_same_way() {
+    // The entry is a bare DSN rather than a table of fields. It says as much about the
+    // Project as the misspelled one does — the user pinned this Project and the plugin can
+    // do nothing with what they wrote — so it must not be the one shape that falls through.
+    let host = overriding(keyed_to_a_bare_string());
+    assert_eq!(
+        declined_overriding(&host),
+        Diagnosis::OverrideIncomplete {
+            file: PathBuf::from(OVERRIDES),
+        },
+    );
+}
+
+#[test]
+fn an_override_entry_carrying_no_connection_is_not_resolved_around() {
+    // There is a running database this Project would otherwise resolve to, and it is local
+    // and writable — the exact Pane the user believes they replaced with a read-only remote
+    // one. Nothing on screen would be wrong, which is what makes falling through worse than
+    // declining.
+    let world = DockerHost::running(vec![container()]);
+    let host = Overriding::at(OVERRIDES, mistyped(), &world);
+    assert!(
+        matches!(
+            planned_overriding(&host),
+            Plan::Decline(Diagnosis::OverrideIncomplete { .. }),
+        ),
+        "an Override entry with nothing usable in it fell through to a Candidate the user \
+         never asked for",
+    );
+}
+
+#[test]
+fn an_override_entry_carrying_no_connection_quotes_none_of_its_contents() {
+    // The entry holds the DSN whatever else it is missing, so this Decline is on screen for
+    // as long as the Pane is with credentials one line away (AC 9, ADR-0005). It names the
+    // file and the keys an Override needs, and nothing the user wrote.
+    let host = overriding(mistyped());
+    let message = declined_overriding(&host).message();
+    for secret in [REMOTE, "secret", "db.staging.internal", "orders staging"] {
+        assert!(
+            !message.contains(secret),
+            "the Decline echoes `{secret}` out of the Override file: {message}",
+        );
+    }
 }
 
 #[test]

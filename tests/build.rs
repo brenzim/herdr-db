@@ -100,10 +100,32 @@ fn cargo_home_without_an_env_file(label: &str) -> PathBuf {
 
 /// A directory holding an executable stub named after the Client, for the runs that need
 /// the install-time check to pass without depending on what this machine has installed.
+///
+/// The stub answers `-h` with an option listing, as the Client does, because the build step
+/// asks the Client which options it has — a stub that answered nothing would take every one
+/// of these runs down the unconfirmable path rather than the ordinary one.
 fn directory_containing_a_stub_client(label: &str) -> PathBuf {
+    directory_containing_a_client(label, "  -read-only\n    Connect in read-only mode")
+}
+
+/// A stub Client that lists `options` when asked for its usage, and exits 0 for anything
+/// else — the Pane execs it and cares only that it ran.
+fn directory_containing_a_client(label: &str, options: &str) -> PathBuf {
     let dir = scratch(label);
     let stub = dir.join(client::PROGRAM);
-    fs::write(&stub, "#!/bin/sh\nexit 0\n").expect("write the stub Client");
+    // `echo` and nothing else: some of these runs put the stub on a PATH holding nothing
+    // but its own directory, where a stub reaching for an external command would print an
+    // error where its usage should be — and the build step would read that as a Client
+    // whose options do not include the one it needs.
+    let listed: String = options
+        .lines()
+        .map(|line| format!("echo '{line}' >&2\n"))
+        .collect();
+    fs::write(
+        &stub,
+        format!("#!/bin/sh\ncase \"$1\" in -h|--help)\n{listed};;\nesac\nexit 0\n"),
+    )
+    .expect("write the stub Client");
     fs::set_permissions(&stub, fs::Permissions::from_mode(0o755))
         .expect("make the stub Client executable");
     dir
@@ -139,6 +161,59 @@ fn refuses_to_install_when_the_client_is_missing_and_says_how_to_install_it() {
         said.contains("brew install"),
         "the failure must name how to install the Client, but it said:\n{said}",
     );
+}
+
+#[test]
+fn refuses_to_install_when_the_client_cannot_open_a_connection_read_only() {
+    // ADR-0001 pre-committed to this check the moment the plugin came to depend on a flag
+    // that arrived in a particular release, and `-read-only` is that flag: it is the default
+    // for every Override, and the Pane execs the Client with it. A Client that does not know
+    // it exits with a parse error the plugin is no longer running to catch — a raw error in
+    // the Pane, under a title saying the connection was made.
+    let stubs = directory_containing_a_client("old-client-path", "  -config string\n  -version");
+    let out = build_step()
+        .env("PATH", stubs)
+        .output()
+        .expect("run the build step");
+    let said = everything_said(&out);
+
+    assert!(
+        !out.status.success(),
+        "a Client that cannot open a connection read-only must fail the install, but it \
+         succeeded saying:\n{said}",
+    );
+    assert!(
+        said.contains("-read-only"),
+        "the failure must name the option the Client is missing, but it said:\n{said}",
+    );
+}
+
+#[test]
+fn installs_when_the_client_will_not_say_which_options_it_has() {
+    // The check reads the Client's own usage, which is not a contract: a future release that
+    // words it differently, or an installation that answers nothing at all, must not be able
+    // to block an install. Silence is unconfirmable rather than wrong, so it warns and goes
+    // on — the failure it would otherwise cause is one this plugin invented.
+    let tree = fresh_copy_of_the_source_tree("silent-client-tree");
+    let stubs = directory_containing_a_client("silent-client-path", "");
+    let path = format!(
+        "{}:{}",
+        stubs.display(),
+        std::env::var("PATH").unwrap_or_default(),
+    );
+
+    let out = Command::new("/bin/sh")
+        .arg("scripts/build.sh")
+        .current_dir(&tree)
+        .env("PATH", path)
+        .output()
+        .expect("run the build step");
+    assert!(
+        out.status.success(),
+        "a Client that lists no options must still install, but the build step said:\n{}",
+        everything_said(&out),
+    );
+    assert!(tree.join(pane_binary_path()).is_file());
 }
 
 #[test]
