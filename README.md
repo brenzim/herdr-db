@@ -30,6 +30,37 @@ There is deliberately no hardcoded DSN. A Pane that confidently connects to a da
 did not resolve is the exact failure this plugin exists to prevent, so the Client is not
 launched until a Strategy resolves a connection for the Project.
 
+## Overriding a Project's connection
+
+Where the Strategies cannot know the answer — a database on another machine, one behind a
+tunnel, one whose credentials live nowhere the plugin can look — an Override states it
+outright. Overrides are read from `overrides.toml` in herdr's plugin config directory,
+which herdr names to the Pane as `HERDR_PLUGIN_CONFIG_DIR`. Each Project is keyed by its
+absolute path:
+
+```toml
+[projects."/Users/you/code/orders"]
+dsn = "postgres://orders_ro:secret@db.staging.internal:5432/orders"
+label = "orders · staging"
+read_only = false
+```
+
+`dsn` and `label` are both required: the label is what the Pane announces, and a connection
+nobody can see the identity of is the one this plugin exists to prevent (ADR-0006). An entry
+missing either pins the Project without connecting it, and the Pane declines saying so.
+
+`read_only` defaults to `true`, and only the boolean `false` turns it off — a missing key, a
+misspelling, or a `"false"` written as a string all leave the Pane read-only. That is the
+opposite default from a discovered container, deliberately: an Override is by construction
+the route to something the Strategies refuse to infer, and the only route off localhost
+(ADR-0005), which correlates with a database somebody else may be using.
+
+An Override wins outright. Where the file pins the Project, the Strategy chain is not
+consulted at all, and neither is it consulted when the file is unreadable or the entry is
+incomplete — a Pane the user believes is their Override but is a discovered Candidate is the
+one wrong outcome with nothing on screen to notice. The file is input only; the plugin
+never writes to it.
+
 ## Requirements
 
 - herdr 0.8.0 or later, on Linux or macOS

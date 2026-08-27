@@ -31,7 +31,8 @@ pub struct Overrides {
 /// What the Override file says about one Project.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Overridden {
-    /// No config directory, no file, or a file naming no Override for this Project.
+    /// No config directory, no file the plugin could read, or a file naming no Override for
+    /// this Project — a file with no `projects` table at all included.
     Silent,
     Pinned(Override),
     /// The file was read and is not TOML. Carries the path and nothing out of the file: a
@@ -71,8 +72,8 @@ impl Overrides {
 
     /// The directory a test states outright.
     ///
-    /// An empty value has named no directory, the same rule the invocation context and the
-    /// Pane id are read under. It cannot be allowed through as a path: joining the file name
+    /// An empty value has named no directory, the same rule the invocation context's tiers
+    /// and the Pane id are read under. It cannot be allowed through as a path: joining the file name
     /// onto it yields a *relative* `overrides.toml`, which resolves against the process
     /// working directory — for a plugin Pane, this plugin's own install directory (ADR-0004).
     pub fn at(directory: Option<&Path>) -> Self {
@@ -143,8 +144,9 @@ fn keyed<'a>(
 ///
 /// Both fields are required: a connection with no label cannot be announced, and announcing
 /// which database is open is what makes the Pane safe to work in (ADR-0006). An entry missing
-/// either is a fault of that entry alone — the rest of the file is read as written, and only
-/// the Project this entry names declines.
+/// either declines for the Project it names rather than falling back to the Strategy chain:
+/// the user pinned this Project, so a Candidate resolved around a broken pin would connect
+/// somewhere they believe is overridden.
 ///
 /// An empty value is one that is missing, the rule every tier here reads a value under. A
 /// written-out `dsn = ""` is no connection, and `label = ""` announces nothing.
@@ -156,7 +158,8 @@ fn stated(pinned: &toml::Value) -> Option<Override> {
     })
 }
 
-/// The string `key` holds in this entry, or `None` where the entry does not state one.
+/// The string `key` holds in this entry, or `None` where the entry states nothing under
+/// `key`, an empty string counting as nothing.
 fn written<'a>(pinned: &'a toml::Value, key: &str) -> Option<&'a str> {
     pinned
         .get(key)

@@ -73,7 +73,7 @@ lists_options() {
   return 1
 }
 
-# stdin is closed for the probe: the Client this check exists for is the *old* one, and a
+# stdin is taken from /dev/null for the probe — open, but at EOF at once: the Client this check exists for is the *old* one, and a
 # release that does not parse `-h` reads it as a positional and opens its full-screen picker,
 # which would sit on the install's terminal forever with its output captured.
 client_options="$(lazysql -h </dev/null 2>&1 || true)"
