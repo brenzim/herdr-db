@@ -2174,6 +2174,17 @@ fn mistyped() -> String {
     format!("[projects.\"{PROJECT}\"]\ndsn = \"{REMOTE}\"\nlable = \"orders staging\"\n")
 }
 
+/// An Override file whose entry has both keys spelled right and `dsn` left empty: the shape
+/// a user leaves behind when they write the entry before they have the connection string.
+fn emptied() -> String {
+    format!("[projects.\"{PROJECT}\"]\ndsn = \"\"\nlabel = \"orders staging\"\n")
+}
+
+/// The same with the label emptied instead, the connection itself written out.
+fn unlabelled() -> String {
+    format!("[projects.\"{PROJECT}\"]\ndsn = \"{REMOTE}\"\nlabel = \"\"\n")
+}
+
 /// The same shape one level flatter: the Project's key holds the DSN itself rather than a
 /// table, which is how a user writes it before reading the file's documentation.
 fn keyed_to_a_bare_string() -> String {
@@ -2501,6 +2512,33 @@ fn an_override_entry_carrying_no_connection_declines_and_names_the_file() {
         diagnosis.message().contains(OVERRIDES),
         "the Decline never names the file to go and fix: {}",
         diagnosis.message(),
+    );
+}
+
+#[test]
+fn an_override_entry_whose_dsn_is_empty_declines_the_same_way() {
+    // An empty value has named nothing, at every tier the plugin reads one. Honouring this
+    // one would exec the Client on an empty DSN — no connection at all — under a title
+    // saying an Override is in force.
+    let host = overriding(emptied());
+    assert_eq!(
+        declined_overriding(&host),
+        Diagnosis::OverrideIncomplete {
+            file: PathBuf::from(OVERRIDES),
+        },
+    );
+}
+
+#[test]
+fn an_override_entry_whose_label_is_empty_declines_the_same_way() {
+    // The label is what announces which database is open, which is what makes the Pane safe
+    // to work in (ADR-0006). An empty one announces nothing.
+    let host = overriding(unlabelled());
+    assert_eq!(
+        declined_overriding(&host),
+        Diagnosis::OverrideIncomplete {
+            file: PathBuf::from(OVERRIDES),
+        },
     );
 }
 

@@ -145,15 +145,23 @@ fn keyed<'a>(
 /// which database is open is what makes the Pane safe to work in (ADR-0006). An entry missing
 /// either is a fault of that entry alone — the rest of the file is read as written, and only
 /// the Project this entry names declines.
+///
+/// An empty value is one that is missing, the rule every tier here reads a value under. A
+/// written-out `dsn = ""` is no connection, and `label = ""` announces nothing.
 fn stated(pinned: &toml::Value) -> Option<Override> {
     Some(Override {
-        dsn: pinned.get("dsn").and_then(toml::Value::as_str)?.to_string(),
-        label: pinned
-            .get("label")
-            .and_then(toml::Value::as_str)?
-            .to_string(),
+        dsn: written(pinned, "dsn")?.to_string(),
+        label: written(pinned, "label")?.to_string(),
         read_only: read_only(pinned),
     })
+}
+
+/// The string `key` holds in this entry, or `None` where the entry does not state one.
+fn written<'a>(pinned: &'a toml::Value, key: &str) -> Option<&'a str> {
+    pinned
+        .get(key)
+        .and_then(toml::Value::as_str)
+        .filter(|stated| !stated.is_empty())
 }
 
 /// Whether the connection opens read-only, which it does unless the entry says outright that

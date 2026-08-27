@@ -217,6 +217,36 @@ fn installs_when_the_client_will_not_say_which_options_it_has() {
 }
 
 #[test]
+fn installs_when_the_client_answers_in_a_shape_that_lists_no_options() {
+    // Silence is not the only unconfirmable answer. A release that rejects `-h` outright, or
+    // a `command -v` hit that turns out not to be runnable, puts a line of prose where the
+    // usage should be — an answer that says nothing about which options exist, and so must
+    // not be read as the Client saying it lacks this one.
+    let tree = fresh_copy_of_the_source_tree("terse-client-tree");
+    let stubs =
+        directory_containing_a_client("terse-client-path", "lazysql: unknown flag -h, try --help");
+    let path = format!(
+        "{}:{}",
+        stubs.display(),
+        std::env::var("PATH").unwrap_or_default(),
+    );
+
+    let out = Command::new("/bin/sh")
+        .arg("scripts/build.sh")
+        .current_dir(&tree)
+        .env("PATH", path)
+        .output()
+        .expect("run the build step");
+    assert!(
+        out.status.success(),
+        "a Client whose answer lists no options must still install, but the build step \
+         said:\n{}",
+        everything_said(&out),
+    );
+    assert!(tree.join(pane_binary_path()).is_file());
+}
+
+#[test]
 fn compiles_the_pane_binary_to_the_path_the_manifest_names() {
     let tree = fresh_copy_of_the_source_tree("compile-tree");
     let stubs = directory_containing_a_stub_client("compile-path");
