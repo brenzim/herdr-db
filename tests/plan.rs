@@ -2164,8 +2164,45 @@ fn pinning_and(key: &str, also: &str) -> String {
 
 /// An Override file that is not TOML: the DSN's string is never closed. The fault is on the
 /// credential-bearing line deliberately — that is the line a parser error quotes back.
-fn malformed(key: &str) -> String {
-    format!("[projects.\"{key}\"]\ndsn = \"{REMOTE}\nlabel = \"orders staging\"\n")
+fn malformed() -> String {
+    format!("[projects.\"{PROJECT}\"]\ndsn = \"{REMOTE}\nlabel = \"orders staging\"\n")
+}
+
+/// An Override file at the one path the plugin looks in, with nothing behind it.
+fn overriding(contents: String) -> Overriding<'static> {
+    Overriding::at(OVERRIDES, contents, &SilentHost)
+}
+
+/// The Overrides herdr named a config directory for.
+fn configured() -> Overrides {
+    Overrides::at(Some(Path::new(CONFIG)))
+}
+
+/// Drives `plan()` for the Project against `host`, with the config directory named.
+fn planned_overriding(host: &dyn Host) -> Plan {
+    planned_with(PROJECT, &configured(), host)
+}
+
+/// The Launch a pinned Project plans, or a failure naming what it declined with instead.
+fn pinned(host: &dyn Host) -> Launch {
+    match planned_overriding(host) {
+        Plan::Launch(launch) => launch,
+        Plan::Decline(diagnosis) => panic!(
+            "an Override naming this Project did not launch, and declined: {}",
+            diagnosis.message(),
+        ),
+    }
+}
+
+/// The Diagnosis a pinned Project declines with, or a failure naming what it launched.
+fn declined_overriding(host: &dyn Host) -> Diagnosis {
+    match planned_overriding(host) {
+        Plan::Decline(diagnosis) => diagnosis,
+        Plan::Launch(launch) => panic!(
+            "a broken Override file was resolved around, and launched: {}",
+            launch.title,
+        ),
+    }
 }
 
 #[test]
@@ -2174,12 +2211,8 @@ fn an_override_pins_the_project_to_its_own_dsn_verbatim() {
     // written. Nothing here is derived, and nothing is checked against localhost — an
     // Override is the only route to a database that is not local (ADR-0005), and a plugin
     // that rebuilt the DSN from parts would be parsing the user's own credential string.
-    let host = Overriding::at(OVERRIDES, pinning(PROJECT), &SilentHost);
-    let Plan::Launch(launch) =
-        planned_with(PROJECT, &Overrides::at(Some(Path::new(CONFIG))), &host)
-    else {
-        panic!("an Override naming this Project did not launch");
-    };
+    let host = overriding(pinning(PROJECT));
+    let launch = pinned(&host);
     // The DSN is the Client's positional argument, so it is the last thing on the line
     // whatever flags precede it.
     assert_eq!(launch.argv.last().unwrap(), REMOTE);
@@ -2190,12 +2223,8 @@ fn the_title_names_the_label_and_says_the_connection_was_overridden() {
     // The one thing on screen for as long as the Pane is. An Override may be remote and was
     // vouched for by no Strategy, so a Pane that looked like every other Pane would be the
     // least safe one there (AC 21).
-    let host = Overriding::at(OVERRIDES, pinning(PROJECT), &SilentHost);
-    let Plan::Launch(launch) =
-        planned_with(PROJECT, &Overrides::at(Some(Path::new(CONFIG))), &host)
-    else {
-        panic!("an Override naming this Project did not launch");
-    };
+    let host = overriding(pinning(PROJECT));
+    let launch = pinned(&host);
     assert_eq!(launch.title, "orders staging · override");
 }
 
@@ -2207,11 +2236,7 @@ fn an_override_wins_over_a_running_candidate() {
     // no escape hatch at all (AC 20).
     let world = DockerHost::running(vec![container()]);
     let host = Overriding::at(OVERRIDES, pinning(PROJECT), &world);
-    let Plan::Launch(launch) =
-        planned_with(PROJECT, &Overrides::at(Some(Path::new(CONFIG))), &host)
-    else {
-        panic!("an Override lost to a discovered Candidate");
-    };
+    let launch = pinned(&host);
     assert_eq!(launch.argv.last().unwrap(), REMOTE);
     assert_eq!(launch.title, "orders staging · override");
 }
@@ -2221,7 +2246,7 @@ fn a_config_directory_herdr_did_not_name_is_not_a_directory_to_read_from() {
     // herdr set no config directory, so there is no Override file — and nothing is guessed
     // at, because ADR-0005 names one location and a fallback of the plugin's own choosing
     // would be a second, undocumented one.
-    let host = Overriding::at(OVERRIDES, pinning(PROJECT), &SilentHost);
+    let host = overriding(pinning(PROJECT));
     assert_eq!(
         planned_with(PROJECT, &Overrides::at(None), &host),
         found_nothing()
@@ -2256,12 +2281,9 @@ fn an_override_key_is_matched_as_a_path_and_not_as_text() {
     // put there. Compared as text that is a different string; compared as the path it is, it
     // is the same directory — and an escape hatch that silently does nothing because of a
     // trailing slash is an escape hatch nobody can debug.
-    let host = Overriding::at(OVERRIDES, pinning(&format!("{PROJECT}/")), &SilentHost);
+    let host = overriding(pinning(&format!("{PROJECT}/")));
     assert!(
-        matches!(
-            planned_with(PROJECT, &Overrides::at(Some(Path::new(CONFIG))), &host),
-            Plan::Launch(_),
-        ),
+        matches!(planned_overriding(&host), Plan::Launch(_)),
         "an Override keyed with a trailing slash did not match the Project",
     );
 }
@@ -2276,11 +2298,7 @@ fn an_override_keyed_under_a_symlink_still_pins_the_project() {
     let host = Overriding::at(OVERRIDES, pinning("/private/var/orders"), &world);
     assert!(
         matches!(
-            planned_with(
-                "/var/orders",
-                &Overrides::at(Some(Path::new(CONFIG))),
-                &host
-            ),
+            planned_with("/var/orders", &configured(), &host),
             Plan::Launch(_),
         ),
         "an Override keyed by the canonical path did not match the Project herdr named",
@@ -2296,10 +2314,7 @@ fn an_override_for_a_directory_this_machine_does_not_have_still_pins_it() {
     let world = DockerHost::running(Vec::new()).linking(PROJECT, None);
     let host = Overriding::at(OVERRIDES, pinning(PROJECT), &world);
     assert!(
-        matches!(
-            planned_with(PROJECT, &Overrides::at(Some(Path::new(CONFIG))), &host),
-            Plan::Launch(_),
-        ),
+        matches!(planned_overriding(&host), Plan::Launch(_)),
         "an Override was dropped because its Project directory does not resolve",
     );
 }
@@ -2310,12 +2325,8 @@ fn an_override_that_says_nothing_about_writing_opens_read_only() {
     // Override is by construction the route to something the Strategies refuse to infer,
     // which correlates with "someone else may be using this". The flag has to reach the
     // Client for the default to mean anything (AC 18).
-    let host = Overriding::at(OVERRIDES, pinning(PROJECT), &SilentHost);
-    let Plan::Launch(launch) =
-        planned_with(PROJECT, &Overrides::at(Some(Path::new(CONFIG))), &host)
-    else {
-        panic!("an Override naming this Project did not launch");
-    };
+    let host = overriding(pinning(PROJECT));
+    let launch = pinned(&host);
     assert!(launch.read_only, "an Override opened read-write by default");
     assert_eq!(launch.argv, ["lazysql", "-read-only", REMOTE]);
 }
@@ -2324,16 +2335,8 @@ fn an_override_that_says_nothing_about_writing_opens_read_only() {
 fn an_override_saying_read_only_is_false_opens_read_write() {
     // The user's own machine, the user's own statement: an escape hatch that could not be
     // written through would send them back to a terminal for every edit (AC 19).
-    let host = Overriding::at(
-        OVERRIDES,
-        pinning_and(PROJECT, "read_only = false"),
-        &SilentHost,
-    );
-    let Plan::Launch(launch) =
-        planned_with(PROJECT, &Overrides::at(Some(Path::new(CONFIG))), &host)
-    else {
-        panic!("an Override naming this Project did not launch");
-    };
+    let host = overriding(pinning_and(PROJECT, "read_only = false"));
+    let launch = pinned(&host);
     assert!(
         !launch.read_only,
         "an explicit read_only = false was not honoured",
@@ -2346,16 +2349,8 @@ fn a_read_only_of_the_wrong_type_leaves_the_override_read_only() {
     // `read_only = "false"` is a string, and the direction it falls in is the whole question:
     // one typo away from the safe default is a silent write-enable on a database someone else
     // may be using. Only `read_only = false` opens writing.
-    let host = Overriding::at(
-        OVERRIDES,
-        pinning_and(PROJECT, "read_only = \"false\""),
-        &SilentHost,
-    );
-    let Plan::Launch(launch) =
-        planned_with(PROJECT, &Overrides::at(Some(Path::new(CONFIG))), &host)
-    else {
-        panic!("an Override naming this Project did not launch");
-    };
+    let host = overriding(pinning_and(PROJECT, "read_only = \"false\""));
+    let launch = pinned(&host);
     assert!(
         launch.read_only,
         "a wrong-typed read_only opened the database for writing",
@@ -2369,11 +2364,7 @@ fn a_pinned_project_asks_docker_nothing() {
     // the one path the user configured by hand to be fast and deterministic.
     let world = DockerHost::running(vec![container()]);
     let host = Overriding::at(OVERRIDES, pinning(PROJECT), &world);
-    let Plan::Launch(launch) =
-        planned_with(PROJECT, &Overrides::at(Some(Path::new(CONFIG))), &host)
-    else {
-        panic!("an Override naming this Project did not launch");
-    };
+    let launch = pinned(&host);
     assert_eq!(launch.title, "orders staging · override");
     assert!(
         host.ran.borrow().is_empty(),
@@ -2390,10 +2381,7 @@ fn a_pinned_project_renders_no_stack() {
     let world = ComposeHost::stack(INFRA, OVERRIDDEN_PORT);
     let host = Overriding::at(OVERRIDES, pinning(PROJECT), &world);
     assert!(
-        matches!(
-            planned_with(PROJECT, &Overrides::at(Some(Path::new(CONFIG))), &host),
-            Plan::Launch(_),
-        ),
+        matches!(planned_overriding(&host), Plan::Launch(_)),
         "an Override naming this Project did not launch",
     );
     assert!(
@@ -2417,11 +2405,7 @@ fn a_pinned_project_declaring_a_stopped_database_launches_anyway() {
         "the double no longer declares a stopped database, so this test proves nothing",
     );
     let host = Overriding::at(OVERRIDES, pinning(PROJECT), &world);
-    let Plan::Launch(launch) =
-        planned_with(PROJECT, &Overrides::at(Some(Path::new(CONFIG))), &host)
-    else {
-        panic!("a pinned Project declined over a Stack it is not using");
-    };
+    let launch = pinned(&host);
     assert_eq!(launch.argv.last().unwrap(), REMOTE);
 }
 
@@ -2430,11 +2414,8 @@ fn an_override_file_naming_other_projects_says_nothing_about_this_one() {
     // One machine-local file holds every Project the user has pinned, so most of what it
     // says is about somewhere else. Reading it must leave this Project exactly where an
     // absent file would: back on the chain, and declining as if nothing had been read.
-    let host = Overriding::at(OVERRIDES, pinning("/Users/b/AI/billing"), &SilentHost);
-    assert_eq!(
-        planned_with(PROJECT, &Overrides::at(Some(Path::new(CONFIG))), &host),
-        found_nothing(),
-    );
+    let host = overriding(pinning("/Users/b/AI/billing"));
+    assert_eq!(planned_overriding(&host), found_nothing());
 }
 
 #[test]
@@ -2442,12 +2423,8 @@ fn a_malformed_override_file_declines_and_names_the_file() {
     // The file is the user's own, hand-written, and the only thing they can fix. Ignoring a
     // typo in it leaves the escape hatch silently shut with nothing on screen to say why
     // (AC 24), so the fault is shown and the file is named so it can be opened.
-    let host = Overriding::at(OVERRIDES, malformed(PROJECT), &SilentHost);
-    let Plan::Decline(diagnosis) =
-        planned_with(PROJECT, &Overrides::at(Some(Path::new(CONFIG))), &host)
-    else {
-        panic!("a malformed Override file was ignored rather than diagnosed");
-    };
+    let host = overriding(malformed());
+    let diagnosis = declined_overriding(&host);
     assert_eq!(
         diagnosis,
         Diagnosis::OverrideUnreadable {
@@ -2467,12 +2444,8 @@ fn a_malformed_override_file_quotes_none_of_its_own_contents() {
     // Every DSN is redacted wherever it is displayed (AC 9, ADR-0005), and a Decline is on
     // screen for as long as the Pane is — so the diagnosis carries the path and nothing
     // else. `tests/redaction.rs` scans source and cannot see this one.
-    let host = Overriding::at(OVERRIDES, malformed(PROJECT), &SilentHost);
-    let Plan::Decline(diagnosis) =
-        planned_with(PROJECT, &Overrides::at(Some(Path::new(CONFIG))), &host)
-    else {
-        panic!("a malformed Override file was ignored rather than diagnosed");
-    };
+    let host = overriding(malformed());
+    let diagnosis = declined_overriding(&host);
     let message = diagnosis.message();
     for secret in [REMOTE, "secret", "db.staging.internal", "orders staging"] {
         assert!(
@@ -2488,10 +2461,10 @@ fn a_malformed_override_file_is_not_resolved_around() {
     // to it would open a Pane the user believes is their Override and is not — the one
     // outcome worse than declining, because nothing on screen would be wrong.
     let world = DockerHost::running(vec![container()]);
-    let host = Overriding::at(OVERRIDES, malformed(PROJECT), &world);
+    let host = Overriding::at(OVERRIDES, malformed(), &world);
     assert!(
         matches!(
-            planned_with(PROJECT, &Overrides::at(Some(Path::new(CONFIG))), &host),
+            planned_overriding(&host),
             Plan::Decline(Diagnosis::OverrideUnreadable { .. }),
         ),
         "a broken Override file fell through to a Candidate the user never asked for",
@@ -2502,11 +2475,8 @@ fn a_malformed_override_file_is_not_resolved_around() {
 fn an_empty_override_file_says_nothing_and_is_not_a_fault() {
     // An empty file is valid TOML declaring nothing — the state a user is in the moment
     // they create the file. Declining on it would make an unpinned Project unresolvable.
-    let host = Overriding::at(OVERRIDES, String::new(), &SilentHost);
-    assert_eq!(
-        planned_with(PROJECT, &Overrides::at(Some(Path::new(CONFIG))), &host),
-        found_nothing(),
-    );
+    let host = overriding(String::new());
+    assert_eq!(planned_overriding(&host), found_nothing());
 }
 
 #[test]
@@ -2520,10 +2490,7 @@ fn an_override_file_that_cannot_be_read_at_all_says_nothing() {
         pinning(PROJECT),
         &SilentHost,
     );
-    assert_eq!(
-        planned_with(PROJECT, &Overrides::at(Some(Path::new(CONFIG))), &host),
-        found_nothing(),
-    );
+    assert_eq!(planned_overriding(&host), found_nothing());
 }
 
 /// A verified trap, not a style preference (ADR-0004).

@@ -27,6 +27,19 @@ pub struct Launch {
     pub read_only: bool,
 }
 
+impl Launch {
+    /// The one place a Launch is assembled, so that `argv` and `read_only` cannot disagree.
+    /// Stated separately they are one fact written twice, and the pair that compiles while
+    /// contradicting itself is the one that opens a writable Pane a caller believed was not.
+    fn of(dsn: &str, title: String, read_only: bool) -> Self {
+        Self {
+            argv: client::argv(dsn, read_only),
+            title,
+            read_only,
+        }
+    }
+}
+
 /// Why resolution declined, in the user's terms.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Diagnosis {
@@ -68,11 +81,7 @@ pub fn plan(context: &InvocationContext, overrides: &Overrides, host: &dyn Host)
     };
     match overrides.pinning(&project, host) {
         Overridden::Pinned(pinned) => {
-            return Plan::Launch(Launch {
-                argv: client::argv(&pinned.dsn, pinned.read_only),
-                title: pinned.title(),
-                read_only: pinned.read_only,
-            });
+            return Plan::Launch(Launch::of(&pinned.dsn, pinned.title(), pinned.read_only));
         }
         // Declining rather than going on down the chain: the user wrote the file to be
         // used, and a Pane they believe is their Override but is a Candidate resolved
@@ -101,11 +110,11 @@ pub fn plan(context: &InvocationContext, overrides: &Overrides, host: &dyn Host)
         }
         return Plan::Decline(Diagnosis::NoConnectionFound { project });
     };
-    Plan::Launch(Launch {
-        argv: client::argv(&candidate.dsn(), candidate.read_only),
-        title: candidate.title(of),
-        read_only: candidate.read_only,
-    })
+    Plan::Launch(Launch::of(
+        &candidate.dsn(),
+        candidate.title(of),
+        candidate.read_only,
+    ))
 }
 
 /// Every Strategy's Candidates as one list: ordered by the chain, then deduplicated so that

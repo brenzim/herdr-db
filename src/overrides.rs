@@ -96,10 +96,9 @@ impl Overrides {
         let Some(projects) = parsed.get(PROJECTS).and_then(toml::Value::as_table) else {
             return Overridden::Silent;
         };
-        match keyed(projects, project, host) {
-            Some(pinned) => stated(pinned),
-            None => Overridden::Silent,
-        }
+        keyed(projects, project, host)
+            .and_then(stated)
+            .map_or(Overridden::Silent, Overridden::Pinned)
     }
 }
 
@@ -117,35 +116,32 @@ fn keyed<'a>(
     project: &Path,
     host: &dyn Host,
 ) -> Option<&'a toml::Value> {
-    if let Some((_, pinned)) = projects
-        .iter()
-        .find(|(key, _)| Path::new(key.as_str()) == project)
-    {
-        return Some(pinned);
-    }
-    let canonical = host.canonicalize(project)?;
     projects
         .iter()
-        .find(|(key, _)| host.canonicalize(Path::new(key.as_str())).as_ref() == Some(&canonical))
+        .find(|(key, _)| Path::new(key.as_str()) == project)
+        .or_else(|| {
+            let canonical = host.canonicalize(project)?;
+            projects.iter().find(|(key, _)| {
+                host.canonicalize(Path::new(key.as_str())).as_ref() == Some(&canonical)
+            })
+        })
         .map(|(_, pinned)| pinned)
 }
 
-/// One entry of the `projects` table as an Override, or `Silent` if it does not carry one.
+/// One entry of the `projects` table as an Override, or `None` if it does not carry one.
 ///
 /// Both fields are required, and an entry missing either says nothing rather than taking the
 /// rest of the file down with it: a connection with no label cannot be announced, and
 /// announcing which database is open is what makes the Pane safe to work in (ADR-0006).
-fn stated(pinned: &toml::Value) -> Overridden {
-    let addressed = pinned.get("dsn").and_then(toml::Value::as_str);
-    let label = pinned.get("label").and_then(toml::Value::as_str);
-    match (addressed, label) {
-        (Some(addressed), Some(label)) => Overridden::Pinned(Override {
-            dsn: addressed.to_string(),
-            label: label.to_string(),
-            read_only: read_only(pinned),
-        }),
-        _ => Overridden::Silent,
-    }
+fn stated(pinned: &toml::Value) -> Option<Override> {
+    Some(Override {
+        dsn: pinned.get("dsn").and_then(toml::Value::as_str)?.to_string(),
+        label: pinned
+            .get("label")
+            .and_then(toml::Value::as_str)?
+            .to_string(),
+        read_only: read_only(pinned),
+    })
 }
 
 /// Whether the connection opens read-only, which it does unless the entry says outright that
