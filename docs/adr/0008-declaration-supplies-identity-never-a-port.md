@@ -46,3 +46,8 @@ Because both Strategies can now produce a Candidate from the same running contai
 are deduplicated on container id with the higher-ranked origin surviving. This is what makes
 "reality beats declaration" observable: where a compose file and a running container disagree,
 one Candidate survives and the title says `docker`.
+
+This also settled what a Strategy *below* the renderer could be worth, since an approximate read of
+a file Compose refuses is bound by the same rule and can propose no port of its own.
+[ADR-0009](./0009-the-strategy-chain-stops-at-declarations-compose-renders.md) ends the chain here
+on that ground and on a survey of every Compose file on the machine.
