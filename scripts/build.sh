@@ -30,6 +30,75 @@ install it and then install this plugin again:
   exit 1
 fi
 
+# The Client is present; the option the plugin depends on is a second question. Every
+# Override opens read-only unless it says otherwise, so the Pane execs `lazysql -read-only
+# <dsn>` on the ordinary path — and a Client that does not define the flag exits on it, after
+# this plugin has already exec'd and has no process left to diagnose anything. ADR-0001 named
+# exactly this as the trigger to check the Client's release at install time. What is asked for
+# is the flag rather than a version number: it is the fact that actually matters, and a release
+# that renamed itself still answers it correctly.
+#
+# The Client's own usage is not a contract, so the check refuses only on a positive answer:
+# options were listed and this one is not among them. Anything else — no output, an unexpected
+# format, a `-h` a future release handles differently — is unconfirmable rather than wrong, and
+# blocking an install on it would be this plugin inventing a failure. Matched with shell
+# pattern-matching rather than grep, so the check needs nothing on PATH but the Client itself.
+#
+# "Options were listed" is a question of its own, asked here rather than assumed of anything
+# that is not empty: a one-line refusal of `-h`, or the shell's own report that what
+# `command -v` found is not runnable, says nothing at all about which options exist.
+newline='
+'
+
+# Whether the answer contains a line that begins an option — leading whitespace ignored,
+# because every usage writer indents them.
+lists_options() {
+  remaining="$1"
+  while [ -n "$remaining" ]; do
+    line="${remaining%%"$newline"*}"
+    case "$remaining" in
+      *"$newline"*) remaining="${remaining#*"$newline"}" ;;
+      *) remaining="" ;;
+    esac
+    while :; do
+      case "$line" in
+        " "* | "	"*) line="${line#?}" ;;
+        *) break ;;
+      esac
+    done
+    case "$line" in
+      -?*) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+# stdin is taken from /dev/null for the probe — open, but at EOF at once: the Client this check exists for is the *old* one, and a
+# release that does not parse `-h` reads it as a positional and opens its full-screen picker,
+# which would sit on the install's terminal forever with its output captured.
+client_options="$(lazysql -h </dev/null 2>&1 || true)"
+case "$client_options" in
+  *-read-only*) ;;
+  *)
+    if ! lists_options "$client_options"; then
+      echo "herdr-db: lazysql did not list its options, so it could not be confirmed to
+support -read-only. Installing anyway; if Panes fail to open, upgrade lazysql." >&2
+    else
+      echo "herdr-db: the installed lazysql does not support -read-only.
+
+herdr-db opens an overridden connection read-only by default and passes that option to
+lazysql. A lazysql that does not know it exits with an error inside the Pane, after this
+plugin has handed control over — so there is nothing left to explain it there. Upgrade
+lazysql and install this plugin again:
+
+    brew upgrade lazysql          # macOS / Linuxbrew
+    go install github.com/jorgerojas26/lazysql@latest
+" >&2
+      exit 1
+    fi
+    ;;
+esac
+
 # Source rustup's env if it is there, so cargo is found even when herdr was launched
 # without ~/.cargo/bin on PATH (a GUI or login-less launch). rustup edits shell rc files
 # only, so a perfectly working toolchain is invisible here otherwise. Written as an `if`

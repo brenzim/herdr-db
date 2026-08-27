@@ -11,6 +11,7 @@ use std::process::{Command, ExitCode};
 use herdr_db::context::InvocationContext;
 use herdr_db::diagnosis::{Turn, diagnosis_screen, on_input};
 use herdr_db::host::RealHost;
+use herdr_db::overrides::Overrides;
 use herdr_db::pane::{self, HERDR};
 use herdr_db::plan::{Diagnosis, Launch, Plan, plan};
 
@@ -19,10 +20,11 @@ fn main() -> ExitCode {
     // re-runs resolution against the same context. What changes between attempts is the
     // world behind the Host — the user starting the database they were told was missing.
     let context = InvocationContext::from_env();
+    let overrides = Overrides::from_env();
     let host = RealHost;
 
     loop {
-        match plan(&context, &host) {
+        match plan(&context, &overrides, &host) {
             Plan::Launch(launch) => return launch_client(launch),
             // Only a retry leaves the screen up; anything else is the user closing the Pane
             // themselves, which is not a failure (AC 7).

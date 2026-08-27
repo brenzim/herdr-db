@@ -10,6 +10,7 @@ use crate::compose::{self, Stopped};
 use crate::context::{InvocationContext, RawContext};
 use crate::docker;
 use crate::host::Host;
+use crate::overrides::{Overridden, Overrides};
 
 /// The outcome of Connection Resolution.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,6 +27,19 @@ pub struct Launch {
     pub read_only: bool,
 }
 
+impl Launch {
+    /// The one place a Launch is assembled, so that `argv` and `read_only` cannot disagree.
+    /// Stated separately they are one fact written twice, and the pair that compiles while
+    /// contradicting itself is the one that opens a writable Pane a caller believed was not.
+    fn of(dsn: &str, title: String, read_only: bool) -> Self {
+        Self {
+            argv: client::argv(dsn, read_only),
+            title,
+            read_only,
+        }
+    }
+}
+
 /// Why resolution declined, in the user's terms.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Diagnosis {
@@ -38,6 +52,17 @@ pub enum Diagnosis {
     DeclaredButNotRunning {
         stopped: Vec<Stopped>,
     },
+    /// The Override file was read and is not TOML. Names the file and quotes none of it:
+    /// the line a parser would point at is the line the credentials are on (ADR-0005).
+    OverrideUnreadable {
+        file: PathBuf,
+    },
+    /// The Override file names this Project and the entry carries no connection. Names the
+    /// file and the keys an Override needs, and quotes nothing: the entry holds a DSN
+    /// whatever else it is missing (ADR-0005).
+    OverrideIncomplete {
+        file: PathBuf,
+    },
     NoConnectionFound {
         project: PathBuf,
     },
@@ -45,7 +70,7 @@ pub enum Diagnosis {
 
 /// Turns what herdr said, plus the world, into a Plan. Never panics: every fault is a
 /// `Decline` the Pane can show (ADR-0004).
-pub fn plan(context: &InvocationContext, host: &dyn Host) -> Plan {
+pub fn plan(context: &InvocationContext, overrides: &Overrides, host: &dyn Host) -> Plan {
     let Some(raw) = context.raw() else {
         return Plan::Decline(Diagnosis::ContextMissing);
     };
@@ -60,6 +85,23 @@ pub fn plan(context: &InvocationContext, host: &dyn Host) -> Plan {
     let Some(project) = parsed.project() else {
         return Plan::Decline(Diagnosis::NoProjectIdentified);
     };
+    match overrides.pinning(&project, host) {
+        Overridden::Pinned(pinned) => {
+            return Plan::Launch(Launch::of(&pinned.dsn, pinned.title(), pinned.read_only));
+        }
+        // Declining rather than going on down the chain: the user wrote the file to be
+        // used, and a Pane they believe is their Override but is a Candidate resolved
+        // around it is the one outcome with nothing wrong on screen to notice.
+        Overridden::Unreadable { file } => {
+            return Plan::Decline(Diagnosis::OverrideUnreadable { file });
+        }
+        // Same reason, one level in: the file named this Project, so the user is pinned
+        // whether or not the plugin could read what they pinned it to.
+        Overridden::Incomplete { file } => {
+            return Plan::Decline(Diagnosis::OverrideIncomplete { file });
+        }
+        Overridden::Silent => {}
+    }
     let sweep = docker::sweep(&project, host);
     let rendered = compose::candidates(&project, host, &sweep);
     let mut candidates = docker::candidates(&project, host, &sweep);
@@ -79,11 +121,11 @@ pub fn plan(context: &InvocationContext, host: &dyn Host) -> Plan {
         }
         return Plan::Decline(Diagnosis::NoConnectionFound { project });
     };
-    Plan::Launch(Launch {
-        argv: client::argv(&candidate.dsn()),
-        title: candidate.title(of),
-        read_only: candidate.read_only,
-    })
+    Plan::Launch(Launch::of(
+        &candidate.dsn(),
+        candidate.title(of),
+        candidate.read_only,
+    ))
 }
 
 /// Every Strategy's Candidates as one list: ordered by the chain, then deduplicated so that
@@ -177,6 +219,19 @@ impl Diagnosis {
                 };
                 format!("{opening}{}", listed(stopped))
             }
+            Self::OverrideUnreadable { file } => format!(
+                "the Override file at {} is not valid TOML, so nothing in it could be \
+                 read. Fix the file and retry; nothing of what it says is repeated here, \
+                 because it holds credentials.",
+                file.display(),
+            ),
+            Self::OverrideIncomplete { file } => format!(
+                "the Override file at {} pins this Project, but the entry carries no \
+                 connection: an Override needs a `dsn` and a `label`, spelled exactly so. \
+                 Fix the entry and retry; nothing of what it says is repeated here, because \
+                 it holds credentials.",
+                file.display(),
+            ),
             Self::NoConnectionFound { project } => format!(
                 "no database connection was found for the Project at {}.",
                 project.display(),

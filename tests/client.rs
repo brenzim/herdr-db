@@ -10,7 +10,21 @@ use herdr_db::client;
 #[test]
 fn launches_the_client_against_the_dsn_and_nothing_else() {
     assert_eq!(
-        client::argv("postgres://app:secret@localhost:5433/app"),
+        client::argv("postgres://app:secret@localhost:5433/app", false),
         ["lazysql", "postgres://app:secret@localhost:5433/app"],
+    );
+}
+
+#[test]
+fn the_read_only_flag_precedes_the_positional_dsn() {
+    // Position, not presence, is the subject — see `client::argv` for why a `-read-only`
+    // written after the DSN is accepted, ignored, and opens read-write.
+    assert_eq!(
+        client::argv("postgres://app:secret@localhost:5433/app", true),
+        [
+            "lazysql",
+            "-read-only",
+            "postgres://app:secret@localhost:5433/app",
+        ],
     );
 }

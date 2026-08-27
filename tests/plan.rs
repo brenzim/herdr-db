@@ -14,6 +14,7 @@ use common::sources;
 use herdr_db::compose::{Stopped, candidates_within};
 use herdr_db::context::InvocationContext;
 use herdr_db::host::{Host, Output};
+use herdr_db::overrides::Overrides;
 use herdr_db::plan::{Diagnosis, Launch, Plan, plan};
 use serde_json::{Value, json};
 
@@ -41,7 +42,11 @@ impl Host for SilentHost {
 }
 
 fn planned(raw: Option<&str>) -> Plan {
-    plan(&InvocationContext::from_json(raw), &SilentHost)
+    plan(
+        &InvocationContext::from_json(raw),
+        &Overrides::at(None),
+        &SilentHost,
+    )
 }
 
 #[test]
@@ -208,6 +213,9 @@ struct Container {
     /// The Compose label numbering this replica of the service, as the string Docker
     /// stores it as.
     number: Option<&'static str>,
+    /// Whatever else the container was labelled with. A container carries the labels its
+    /// image and its author put on it, and none of them are Compose's.
+    labels: Vec<(&'static str, &'static str)>,
     /// `NetworkSettings.Ports`, in Docker's own shape rather than a tidied one.
     ports: Value,
     env: Vec<&'static str>,
@@ -223,6 +231,7 @@ fn container() -> Container {
         working_dir: Some("/Users/b/AI/orders/infra"),
         service: None,
         number: None,
+        labels: Vec::new(),
         ports: published(&["5434"]),
         env: vec!["POSTGRES_USER=app", "POSTGRES_DB=orders", "PATH=/usr/bin"],
     }
@@ -252,6 +261,9 @@ impl Container {
         }
         if let Some(number) = self.number {
             labels["com.docker.compose.container-number"] = json!(number);
+        }
+        for (key, value) in &self.labels {
+            labels[*key] = json!(value);
         }
         json!([{
             "Name": self.name,
@@ -393,10 +405,17 @@ impl Host for DockerHost {
 /// The Project every Docker test resolves for.
 const PROJECT: &str = "/Users/b/AI/orders";
 
-/// Drives `plan()` for a context identifying `project`, against a scripted Docker.
+/// Drives `plan()` for a context identifying `project`, against a scripted Docker and no
+/// Override at all.
 fn planned_for(project: &str, host: &dyn Host) -> Plan {
+    planned_with(project, &Overrides::at(None), host)
+}
+
+/// Drives `plan()` for a context identifying `project`, against a scripted Docker and an
+/// Override file wherever `overrides` says to look for one.
+fn planned_with(project: &str, overrides: &Overrides, host: &dyn Host) -> Plan {
     let raw = format!(r#"{{"worktree":{{"repo_root":"{project}"}}}}"#);
-    plan(&InvocationContext::from_json(Some(&raw)), host)
+    plan(&InvocationContext::from_json(Some(&raw)), overrides, host)
 }
 
 fn planned_against(host: &dyn Host) -> Plan {
@@ -966,9 +985,15 @@ fn a_local_candidate_opens_read_write() {
     // ADR-0005: spot-editing what an agent just wrote is the point of a local database.
     // Read-only is the Override's default instead, because an Override is by construction
     // the route to something someone else may be using.
+    let launch = launched(&DockerHost::running(vec![container()]));
     assert!(
-        !launched(&DockerHost::running(vec![container()])).read_only,
+        !launch.read_only,
         "a container on this machine was opened read-only",
+    );
+    assert!(
+        !launch.argv.contains(&"-read-only".to_string()),
+        "the Client was launched read-only against a local container: {:?}",
+        launch.argv,
     );
 }
 
@@ -1354,6 +1379,7 @@ fn built(working_dir: &'static str, service: &'static str) -> Container {
         number: Some("1"),
         ports: published(&["5432"]),
         env: vec!["POSTGRES_USER=app", "POSTGRES_DB=warehouse"],
+        labels: Vec::new(),
     }
 }
 
@@ -1980,6 +2006,7 @@ fn shared(port: &str) -> Container {
         number: Some("1"),
         ports: published(&[port]),
         env: vec!["POSTGRES_USER=app", "POSTGRES_DB=appdb"],
+        labels: Vec::new(),
     }
 }
 
@@ -2060,6 +2087,530 @@ fn a_declared_database_never_outranks_a_running_one_on_a_higher_port() {
     assert_eq!(launch.argv[1], "postgres://app@127.0.0.1:5434/orders");
 }
 
+/// The plugin config directory herdr names, as the tests state it. Nothing is read from
+/// inside it but the one Override file.
+const CONFIG: &str = "/Users/b/.config/herdr/plugins/db";
+
+/// The Override file's path, spelled out rather than joined, so that a change to either the
+/// directory join or the file name is a failing test and not a silent miss.
+const OVERRIDES: &str = "/Users/b/.config/herdr/plugins/db/overrides.toml";
+
+/// A DSN no Strategy could ever propose: a shared host, off localhost, reached through a
+/// port nothing local publishes. An Override is the only route to one (ADR-0005).
+const REMOTE: &str = "postgres://app:secret@db.staging.internal:6543/orders";
+
+/// A Host that answers with one Override file, and delegates everything else to the world
+/// behind it — so that an Override can be tested against a live Docker as easily as against
+/// nothing at all.
+struct Overriding<'a> {
+    file: PathBuf,
+    contents: String,
+    world: &'a dyn Host,
+    /// Every path read, in order, so that a test can assert on the read that did *not*
+    /// happen.
+    read: RefCell<Vec<PathBuf>>,
+    /// Every command run, in order, so that a test can assert on the command that was *not*
+    /// run.
+    ran: RefCell<Vec<String>>,
+}
+
+impl<'a> Overriding<'a> {
+    /// An Override file at `file`, saying `contents`, in front of `world`.
+    fn at(file: &str, contents: String, world: &'a dyn Host) -> Self {
+        Self {
+            file: PathBuf::from(file),
+            contents,
+            world,
+            read: RefCell::new(Vec::new()),
+            ran: RefCell::new(Vec::new()),
+        }
+    }
+}
+
+impl Host for Overriding<'_> {
+    fn read_file(&self, path: &Path) -> Option<String> {
+        self.read.borrow_mut().push(path.to_path_buf());
+        if path == self.file {
+            return Some(self.contents.clone());
+        }
+        self.world.read_file(path)
+    }
+
+    fn list_dir(&self, path: &Path) -> Vec<PathBuf> {
+        self.world.list_dir(path)
+    }
+
+    fn run(&self, program: &str, args: &[&str], cwd: &Path) -> Option<Output> {
+        self.ran
+            .borrow_mut()
+            .push(format!("{program} {}", args.join(" ")));
+        self.world.run(program, args, cwd)
+    }
+
+    fn canonicalize(&self, path: &Path) -> Option<PathBuf> {
+        self.world.canonicalize(path)
+    }
+}
+
+/// An Override file pinning `key` to a remote database, in the shape a user writes it.
+fn pinning(key: &str) -> String {
+    format!("[projects.\"{key}\"]\ndsn = \"{REMOTE}\"\nlabel = \"orders staging\"\n")
+}
+
+/// The same Override, saying `also` about the connection as well.
+fn pinning_and(key: &str, also: &str) -> String {
+    format!("{}{also}\n", pinning(key))
+}
+
+/// An Override file that is not TOML: the DSN's string is never closed. The fault is on the
+/// credential-bearing line deliberately — that is the line a parser error quotes back.
+fn malformed() -> String {
+    format!("[projects.\"{PROJECT}\"]\ndsn = \"{REMOTE}\nlabel = \"orders staging\"\n")
+}
+
+/// An Override file that parses and names this Project, whose entry carries no connection:
+/// `label` is misspelled. Valid TOML, so no parse error fires — and nothing usable is there.
+fn mistyped() -> String {
+    format!("[projects.\"{PROJECT}\"]\ndsn = \"{REMOTE}\"\nlable = \"orders staging\"\n")
+}
+
+/// An Override file whose entry has both keys spelled right and `dsn` left empty: the shape
+/// a user leaves behind when they write the entry before they have the connection string.
+fn emptied() -> String {
+    format!("[projects.\"{PROJECT}\"]\ndsn = \"\"\nlabel = \"orders staging\"\n")
+}
+
+/// The same with the label emptied instead, the connection itself written out.
+fn unlabelled() -> String {
+    format!("[projects.\"{PROJECT}\"]\ndsn = \"{REMOTE}\"\nlabel = \"\"\n")
+}
+
+/// The same shape one level flatter: the Project's key holds the DSN itself rather than a
+/// table, which is how a user writes it before reading the file's documentation.
+fn keyed_to_a_bare_string() -> String {
+    format!("[projects]\n\"{PROJECT}\" = \"{REMOTE}\"\n")
+}
+
+/// An Override file at the one path the plugin looks in, with nothing behind it.
+fn overriding(contents: String) -> Overriding<'static> {
+    Overriding::at(OVERRIDES, contents, &SilentHost)
+}
+
+/// The Overrides herdr named a config directory for.
+fn configured() -> Overrides {
+    Overrides::at(Some(Path::new(CONFIG)))
+}
+
+/// Drives `plan()` for the Project against `host`, with the config directory named.
+fn planned_overriding(host: &dyn Host) -> Plan {
+    planned_with(PROJECT, &configured(), host)
+}
+
+/// The Launch a pinned Project plans, or a failure naming what it declined with instead.
+fn pinned(host: &dyn Host) -> Launch {
+    match planned_overriding(host) {
+        Plan::Launch(launch) => launch,
+        Plan::Decline(diagnosis) => panic!(
+            "an Override naming this Project did not launch, and declined: {}",
+            diagnosis.message(),
+        ),
+    }
+}
+
+/// The Diagnosis a pinned Project declines with, or a failure naming what it launched.
+fn declined_overriding(host: &dyn Host) -> Diagnosis {
+    match planned_overriding(host) {
+        Plan::Decline(diagnosis) => diagnosis,
+        Plan::Launch(launch) => panic!(
+            "a broken Override file was resolved around, and launched: {}",
+            launch.title,
+        ),
+    }
+}
+
+#[test]
+fn an_override_pins_the_project_to_its_own_dsn_verbatim() {
+    // The escape hatch: the user wrote the connection down, so it is used exactly as
+    // written. Nothing here is derived, and nothing is checked against localhost — an
+    // Override is the only route to a database that is not local (ADR-0005), and a plugin
+    // that rebuilt the DSN from parts would be parsing the user's own credential string.
+    let host = overriding(pinning(PROJECT));
+    let launch = pinned(&host);
+    // The DSN is the Client's positional argument, so it is the last thing on the line
+    // whatever flags precede it.
+    assert_eq!(launch.argv.last().unwrap(), REMOTE);
+}
+
+#[test]
+fn the_title_names_the_label_and_says_the_connection_was_overridden() {
+    // The one thing on screen for as long as the Pane is. An Override may be remote and was
+    // vouched for by no Strategy, so a Pane that looked like every other Pane would be the
+    // least safe one there (AC 21).
+    let host = overriding(pinning(PROJECT));
+    let launch = pinned(&host);
+    assert_eq!(launch.title, "orders staging · override");
+}
+
+#[test]
+fn an_override_wins_over_a_running_candidate() {
+    // The Project has a PostgreSQL running under it that every other test in this file
+    // resolves to. The user said otherwise, so the user wins: an Override is a statement
+    // about something the Strategies cannot know, and one that lost to a container would be
+    // no escape hatch at all (AC 20).
+    let world = DockerHost::running(vec![container()]);
+    let host = Overriding::at(OVERRIDES, pinning(PROJECT), &world);
+    let launch = pinned(&host);
+    assert_eq!(launch.argv.last().unwrap(), REMOTE);
+    assert_eq!(launch.title, "orders staging · override");
+}
+
+#[test]
+fn a_config_directory_herdr_did_not_name_is_not_a_directory_to_read_from() {
+    // herdr set no config directory, so there is no Override file — and nothing is guessed
+    // at, because ADR-0005 names one location and a fallback of the plugin's own choosing
+    // would be a second, undocumented one.
+    let host = overriding(pinning(PROJECT));
+    assert_eq!(
+        planned_with(PROJECT, &Overrides::at(None), &host),
+        found_nothing()
+    );
+    assert!(
+        host.read.borrow().is_empty(),
+        "a file was read with no config directory to read it from: {:?}",
+        host.read.borrow(),
+    );
+}
+
+#[test]
+fn an_empty_config_directory_has_named_no_directory() {
+    // The trap the empty value exists to avoid: joined onto, an empty directory yields a
+    // relative `overrides.toml`, which resolves against the process working directory — for
+    // a plugin Pane, this plugin's own install directory (ADR-0004).
+    let host = Overriding::at("overrides.toml", pinning(PROJECT), &SilentHost);
+    assert_eq!(
+        planned_with(PROJECT, &Overrides::at(Some(Path::new(""))), &host),
+        found_nothing(),
+    );
+    assert!(
+        host.read.borrow().is_empty(),
+        "an empty config directory was joined onto and read: {:?}",
+        host.read.borrow(),
+    );
+}
+
+#[test]
+fn an_override_key_is_matched_as_a_path_and_not_as_text() {
+    // The user typed the Project's directory with the trailing slash a shell's completion
+    // put there. Compared as text that is a different string; compared as the path it is, it
+    // is the same directory — and an escape hatch that silently does nothing because of a
+    // trailing slash is an escape hatch nobody can debug.
+    let host = overriding(pinning(&format!("{PROJECT}/")));
+    assert!(
+        matches!(planned_overriding(&host), Plan::Launch(_)),
+        "an Override keyed with a trailing slash did not match the Project",
+    );
+}
+
+#[test]
+fn an_override_keyed_under_a_symlink_still_pins_the_project() {
+    // herdr names the Project as `/var/…`, which on macOS is a symlink into `/private/var`;
+    // the user wrote down whichever of the two their shell showed them. Both Strategies
+    // canonicalise for exactly this reason, and an Override that did not would be the one
+    // source the user can see and still cannot get to fire.
+    let world = DockerHost::running(Vec::new()).linking("/var", Some("/private/var"));
+    let host = Overriding::at(OVERRIDES, pinning("/private/var/orders"), &world);
+    assert!(
+        matches!(
+            planned_with("/var/orders", &configured(), &host),
+            Plan::Launch(_),
+        ),
+        "an Override keyed by the canonical path did not match the Project herdr named",
+    );
+}
+
+#[test]
+fn an_override_for_a_directory_this_machine_does_not_have_still_pins_it() {
+    // The Project directory does not resolve at all — an unmounted volume, or a Project
+    // being reached for from somewhere else. Canonicalising *only* would drop every Override
+    // in that state, which is the one time the user most needs the connection they wrote
+    // down by hand.
+    let world = DockerHost::running(Vec::new()).linking(PROJECT, None);
+    let host = Overriding::at(OVERRIDES, pinning(PROJECT), &world);
+    assert!(
+        matches!(planned_overriding(&host), Plan::Launch(_)),
+        "an Override was dropped because its Project directory does not resolve",
+    );
+}
+
+#[test]
+fn an_override_that_says_nothing_about_writing_opens_read_only() {
+    // The default is inverted from every other source, and deliberately so (ADR-0005): an
+    // Override is by construction the route to something the Strategies refuse to infer,
+    // which correlates with "someone else may be using this". The flag has to reach the
+    // Client for the default to mean anything (AC 18).
+    let host = overriding(pinning(PROJECT));
+    let launch = pinned(&host);
+    assert!(launch.read_only, "an Override opened read-write by default");
+    assert_eq!(launch.argv, ["lazysql", "-read-only", REMOTE]);
+}
+
+#[test]
+fn an_override_saying_read_only_is_false_opens_read_write() {
+    // The user's own machine, the user's own statement: an escape hatch that could not be
+    // written through would send them back to a terminal for every edit (AC 19).
+    let host = overriding(pinning_and(PROJECT, "read_only = false"));
+    let launch = pinned(&host);
+    assert!(
+        !launch.read_only,
+        "an explicit read_only = false was not honoured",
+    );
+    assert_eq!(launch.argv, ["lazysql", REMOTE]);
+}
+
+#[test]
+fn a_read_only_of_the_wrong_type_leaves_the_override_read_only() {
+    // `read_only = "false"` is a string, and the direction it falls in is the whole question:
+    // one typo away from the safe default is a silent write-enable on a database someone else
+    // may be using. Only `read_only = false` opens writing.
+    let host = overriding(pinning_and(PROJECT, "read_only = \"false\""));
+    let launch = pinned(&host);
+    assert!(
+        launch.read_only,
+        "a wrong-typed read_only opened the database for writing",
+    );
+}
+
+#[test]
+fn a_pinned_project_asks_docker_nothing() {
+    // The chain stops at the Override (ADR-0009), and stopping it *after* the sweep would
+    // still answer correctly while paying a `docker ps` and an inspect per container — on
+    // the one path the user configured by hand to be fast and deterministic.
+    let world = DockerHost::running(vec![container()]);
+    let host = Overriding::at(OVERRIDES, pinning(PROJECT), &world);
+    let launch = pinned(&host);
+    assert_eq!(launch.title, "orders staging · override");
+    assert!(
+        host.ran.borrow().is_empty(),
+        "a pinned Project still ran: {:?}",
+        host.ran.borrow(),
+    );
+}
+
+#[test]
+fn a_pinned_project_renders_no_stack() {
+    // The expensive half of the chain: a render is a `docker compose config` per Stack,
+    // against a budget of seconds. The Project holds one, and a pinned Project must not
+    // wait on it.
+    let world = ComposeHost::stack(INFRA, OVERRIDDEN_PORT);
+    let host = Overriding::at(OVERRIDES, pinning(PROJECT), &world);
+    assert!(
+        matches!(planned_overriding(&host), Plan::Launch(_)),
+        "an Override naming this Project did not launch",
+    );
+    assert!(
+        world.rendered_in.borrow().is_empty(),
+        "a pinned Project rendered {:?}",
+        world.rendered_in.borrow(),
+    );
+}
+
+#[test]
+fn a_pinned_project_declaring_a_stopped_database_launches_anyway() {
+    // Unpinned, this Project declines with `DeclaredButNotRunning` — it declares a database
+    // and nothing is running it. Pinned, resolution succeeded, so there is nothing to
+    // diagnose: the Stack the user is not using is not their problem.
+    let world = ComposeHost::stack(INFRA, OVERRIDDEN_PORT);
+    assert!(
+        matches!(
+            planned_against(&world),
+            Plan::Decline(Diagnosis::DeclaredButNotRunning { .. }),
+        ),
+        "the double no longer declares a stopped database, so this test proves nothing",
+    );
+    let host = Overriding::at(OVERRIDES, pinning(PROJECT), &world);
+    let launch = pinned(&host);
+    assert_eq!(launch.argv.last().unwrap(), REMOTE);
+}
+
+#[test]
+fn an_override_file_naming_other_projects_says_nothing_about_this_one() {
+    // One machine-local file holds every Project the user has pinned, so most of what it
+    // says is about somewhere else. Reading it must leave this Project exactly where an
+    // absent file would: back on the chain, and declining as if nothing had been read.
+    let host = overriding(pinning("/Users/b/AI/billing"));
+    assert_eq!(planned_overriding(&host), found_nothing());
+}
+
+#[test]
+fn a_malformed_override_file_declines_and_names_the_file() {
+    // The file is the user's own, hand-written, and the only thing they can fix. Ignoring a
+    // typo in it leaves the escape hatch silently shut with nothing on screen to say why
+    // (AC 24), so the fault is shown and the file is named so it can be opened.
+    let host = overriding(malformed());
+    let diagnosis = declined_overriding(&host);
+    assert_eq!(
+        diagnosis,
+        Diagnosis::OverrideUnreadable {
+            file: PathBuf::from(OVERRIDES),
+        },
+    );
+    assert!(
+        diagnosis.message().contains(OVERRIDES),
+        "the Decline never names the file to go and fix: {}",
+        diagnosis.message(),
+    );
+}
+
+#[test]
+fn a_malformed_override_file_quotes_none_of_its_own_contents() {
+    // A TOML parser's error quotes the line it failed on, and here that line is the DSN.
+    // Every DSN is redacted wherever it is displayed (AC 9, ADR-0005), and a Decline is on
+    // screen for as long as the Pane is — so the diagnosis carries the path and nothing
+    // else. `tests/redaction.rs` scans source and cannot see this one.
+    let host = overriding(malformed());
+    let diagnosis = declined_overriding(&host);
+    let message = diagnosis.message();
+    for secret in [REMOTE, "secret", "db.staging.internal", "orders staging"] {
+        assert!(
+            !message.contains(secret),
+            "the Decline echoes `{secret}` out of the Override file: {message}",
+        );
+    }
+}
+
+#[test]
+fn a_malformed_override_file_is_not_resolved_around() {
+    // There is a running database this Project would otherwise resolve to. Falling through
+    // to it would open a Pane the user believes is their Override and is not — the one
+    // outcome worse than declining, because nothing on screen would be wrong.
+    let world = DockerHost::running(vec![container()]);
+    let host = Overriding::at(OVERRIDES, malformed(), &world);
+    assert!(
+        matches!(
+            planned_overriding(&host),
+            Plan::Decline(Diagnosis::OverrideUnreadable { .. }),
+        ),
+        "a broken Override file fell through to a Candidate the user never asked for",
+    );
+}
+
+#[test]
+fn an_override_entry_carrying_no_connection_declines_and_names_the_file() {
+    // A misspelled key keeps the file valid TOML, so nothing above catches it. The entry
+    // still names this Project, which is the user stating they pinned it — so the escape
+    // hatch is either honoured or its failure is shown (AC 24). Resolving on down the chain
+    // would open a local container, read-write, under a title claiming nothing is wrong.
+    let host = overriding(mistyped());
+    let diagnosis = declined_overriding(&host);
+    assert_eq!(
+        diagnosis,
+        Diagnosis::OverrideIncomplete {
+            file: PathBuf::from(OVERRIDES),
+        },
+    );
+    assert!(
+        diagnosis.message().contains(OVERRIDES),
+        "the Decline never names the file to go and fix: {}",
+        diagnosis.message(),
+    );
+}
+
+#[test]
+fn an_override_entry_whose_dsn_is_empty_declines_the_same_way() {
+    // An empty value has named nothing, at every tier the plugin reads one. Honouring this
+    // one would exec the Client on an empty DSN — no connection at all — under a title
+    // saying an Override is in force.
+    let host = overriding(emptied());
+    assert_eq!(
+        declined_overriding(&host),
+        Diagnosis::OverrideIncomplete {
+            file: PathBuf::from(OVERRIDES),
+        },
+    );
+}
+
+#[test]
+fn an_override_entry_whose_label_is_empty_declines_the_same_way() {
+    // The label is what announces which database is open, which is what makes the Pane safe
+    // to work in (ADR-0006). An empty one announces nothing.
+    let host = overriding(unlabelled());
+    assert_eq!(
+        declined_overriding(&host),
+        Diagnosis::OverrideIncomplete {
+            file: PathBuf::from(OVERRIDES),
+        },
+    );
+}
+
+#[test]
+fn an_override_entry_that_is_not_a_table_declines_the_same_way() {
+    // The entry is a bare DSN rather than a table of fields. It says as much about the
+    // Project as the misspelled one does — the user pinned this Project and the plugin can
+    // do nothing with what they wrote — so it must not be the one shape that falls through.
+    let host = overriding(keyed_to_a_bare_string());
+    assert_eq!(
+        declined_overriding(&host),
+        Diagnosis::OverrideIncomplete {
+            file: PathBuf::from(OVERRIDES),
+        },
+    );
+}
+
+#[test]
+fn an_override_entry_carrying_no_connection_is_not_resolved_around() {
+    // There is a running database this Project would otherwise resolve to, and it is local
+    // and writable — the exact Pane the user believes they replaced with a read-only remote
+    // one. Nothing on screen would be wrong, which is what makes falling through worse than
+    // declining.
+    let world = DockerHost::running(vec![container()]);
+    let host = Overriding::at(OVERRIDES, mistyped(), &world);
+    assert!(
+        matches!(
+            planned_overriding(&host),
+            Plan::Decline(Diagnosis::OverrideIncomplete { .. }),
+        ),
+        "an Override entry with nothing usable in it fell through to a Candidate the user \
+         never asked for",
+    );
+}
+
+#[test]
+fn an_override_entry_carrying_no_connection_quotes_none_of_its_contents() {
+    // The entry holds the DSN whatever else it is missing, so this Decline is on screen for
+    // as long as the Pane is with credentials one line away (AC 9, ADR-0005). It names the
+    // file and the keys an Override needs, and nothing the user wrote.
+    let host = overriding(mistyped());
+    let message = declined_overriding(&host).message();
+    for secret in [REMOTE, "secret", "db.staging.internal", "orders staging"] {
+        assert!(
+            !message.contains(secret),
+            "the Decline echoes `{secret}` out of the Override file: {message}",
+        );
+    }
+}
+
+#[test]
+fn an_empty_override_file_says_nothing_and_is_not_a_fault() {
+    // An empty file is valid TOML declaring nothing — the state a user is in the moment
+    // they create the file. Declining on it would make an unpinned Project unresolvable.
+    let host = overriding(String::new());
+    assert_eq!(planned_overriding(&host), found_nothing());
+}
+
+#[test]
+fn an_override_file_that_cannot_be_read_at_all_says_nothing() {
+    // `Host::read_file` answers `None` if it cannot be read for any reason, so an absent
+    // file and one the user has no permission to open arrive here identically. Only "the
+    // bytes were read and are not TOML" is a fault the user can be told anything useful
+    // about; the rest is the ordinary state of a machine with no Override file on it.
+    let host = Overriding::at(
+        "/Users/b/elsewhere/overrides.toml",
+        pinning(PROJECT),
+        &SilentHost,
+    );
+    assert_eq!(planned_overriding(&host), found_nothing());
+}
+
 /// A verified trap, not a style preference (ADR-0004).
 ///
 /// `plan()`'s signature already makes the mistake unreachable: neither the invocation
@@ -2082,6 +2633,139 @@ fn never_establishes_liveness_from_a_listening_port() {
             );
         }
     }
+}
+
+/// The same container, describing a database somewhere else as loudly as a container can:
+/// in its environment, where every other part of the DSN legitimately comes from, and in
+/// its labels. A `DATABASE_URL` naming a production host is what an application container's
+/// environment ordinarily holds, and the database container inherits the same `.env` file.
+fn describing_a_remote_host(base: Container) -> Container {
+    let mut env = base.env;
+    env.extend([
+        "POSTGRES_HOST=db.prod.example.com",
+        "PGHOST=10.0.0.7",
+        "DATABASE_URL=postgres://app:secret@db.prod.example.com:5432/orders",
+    ]);
+    Container {
+        env,
+        labels: vec![
+            ("com.example.database.host", "db.prod.example.com"),
+            ("com.example.database.address", "10.0.0.7"),
+        ],
+        ..base
+    }
+}
+
+#[test]
+fn no_strategy_resolves_a_candidate_away_from_the_loopback() {
+    // AC 22, down both Strategy paths, because they build their Candidates in the same
+    // place and a guard on one of them would let the other one through. A remote database
+    // is reached only by an Override the user wrote (ADR-0005): a shared host is not
+    // disposable, and a Strategy that inferred its address from a container's own
+    // description would connect the user to production because a `.env` file said so.
+    let docker = DockerHost::running(vec![describing_a_remote_host(container())]);
+    let compose = ComposeHost::stack(INFRA, MIXED_STACK)
+        .running(vec![describing_a_remote_host(built(INFRA, "warehouse"))]);
+
+    for (origin, host) in [("docker", &docker as &dyn Host), ("compose", &compose)] {
+        // Asserted rather than assumed: both doubles resolve, so a container that stopped
+        // matching one Strategy would silently be guarded twice by the other.
+        let launch = launched(host);
+        assert!(
+            launch.title.contains(origin),
+            "the {origin} Strategy did not produce this Launch: {}",
+            launch.title,
+        );
+        let dsn = launch.argv[1].clone();
+        assert!(
+            dsn.contains("@127.0.0.1:"),
+            "a Strategy resolved to {dsn}, which is not addressed at the loopback",
+        );
+        for elsewhere in ["db.prod.example.com", "10.0.0.7"] {
+            assert!(
+                !dsn.contains(elsewhere),
+                "a Strategy read {elsewhere} out of the container and put it in {dsn}",
+            );
+        }
+    }
+}
+
+/// The authority every Candidate DSN is addressed with, as `Candidate::dsn` writes it: the
+/// credentials, and then a name that is a constant rather than anything read from Docker.
+const AUTHORITY: &str = "://{credentials}@{HOST}:";
+
+#[test]
+fn no_source_but_the_one_assembles_a_dsn_at_all() {
+    // AC 22 in source, where the behavioural test cannot reach: it can only exercise the
+    // Strategies that exist, and the criterion is about the ones that do not yet. A DSN
+    // needs its scheme separator, so a second place that assembled one would show up here
+    // — and the one place that does assemble one may only address the constant.
+    let assembling: Vec<_> = sources()
+        .into_iter()
+        .filter(|(_, source)| {
+            source
+                .lines()
+                .any(|line| !line.trim_start().starts_with("//") && line.contains("://"))
+        })
+        .collect();
+
+    let [(path, source)] = &assembling[..] else {
+        panic!(
+            "{} source files assemble a DSN: {:?}. Exactly one may (AC 22) — the address is \
+             a constant there, and a Strategy that built its own would be free to address \
+             whatever a container told it to",
+            assembling.len(),
+            assembling.iter().map(|(path, _)| path).collect::<Vec<_>>(),
+        );
+    };
+    assert!(
+        source.contains(AUTHORITY),
+        "{} assembles a DSN whose authority is not `{AUTHORITY}`. Whatever stands where \
+         `{{HOST}}` did is what the user is connected to",
+        path.display(),
+    );
+    assert!(
+        source.contains("const HOST: &str = \"127.0.0.1\";"),
+        "{} no longer defines `HOST` as the loopback literal, so `{AUTHORITY}` proves \
+         nothing about where a Candidate points",
+        path.display(),
+    );
+}
+
+#[test]
+fn never_writes_a_file() {
+    // AC 23: the Override file is the user's, and a plugin that rewrote it — tidying its
+    // formatting, recording a connection it resolved — would edit a hand-written file
+    // holding credentials. `Host` offers no write at all, so the only route out is `std::fs`
+    // directly, which is what this scans for.
+    let mut reads = false;
+    for (path, source) in sources() {
+        reads |= source.contains("std::fs::read_to_string");
+        for write in [
+            "fs::write",
+            "File::create",
+            "OpenOptions",
+            "File::options",
+            "create_dir",
+            "remove_file",
+            "remove_dir",
+            "fs::rename",
+            "fs::copy",
+            "set_permissions",
+        ] {
+            assert!(
+                !source.contains(write),
+                "{} names `{write}`. The plugin reads the world and never writes to it \
+                 (AC 23)",
+                path.display(),
+            );
+        }
+    }
+    assert!(
+        reads,
+        "no source file reads a file either, so this scan is reading the wrong text and \
+         would pass however the plugin was rewritten",
+    );
 }
 
 #[test]
