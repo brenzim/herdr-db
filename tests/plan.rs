@@ -2100,6 +2100,9 @@ struct Overriding<'a> {
     /// Every path read, in order, so that a test can assert on the read that did *not*
     /// happen.
     read: RefCell<Vec<PathBuf>>,
+    /// Every command run, in order, so that a test can assert on the command that was *not*
+    /// run.
+    ran: RefCell<Vec<String>>,
 }
 
 impl<'a> Overriding<'a> {
@@ -2110,6 +2113,7 @@ impl<'a> Overriding<'a> {
             contents,
             world,
             read: RefCell::new(Vec::new()),
+            ran: RefCell::new(Vec::new()),
         }
     }
 }
@@ -2128,6 +2132,9 @@ impl Host for Overriding<'_> {
     }
 
     fn run(&self, program: &str, args: &[&str], cwd: &Path) -> Option<Output> {
+        self.ran
+            .borrow_mut()
+            .push(format!("{program} {}", args.join(" ")));
         self.world.run(program, args, cwd)
     }
 
@@ -2337,6 +2344,81 @@ fn a_read_only_of_the_wrong_type_leaves_the_override_read_only() {
     assert!(
         launch.read_only,
         "a wrong-typed read_only opened the database for writing",
+    );
+}
+
+#[test]
+fn a_pinned_project_asks_docker_nothing() {
+    // The chain stops at the Override (ADR-0009), and stopping it *after* the sweep would
+    // still answer correctly while paying a `docker ps` and an inspect per container — on
+    // the one path the user configured by hand to be fast and deterministic.
+    let world = DockerHost::running(vec![container()]);
+    let host = Overriding::at(OVERRIDES, pinning(PROJECT), &world);
+    let Plan::Launch(launch) =
+        planned_with(PROJECT, &Overrides::at(Some(Path::new(CONFIG))), &host)
+    else {
+        panic!("an Override naming this Project did not launch");
+    };
+    assert_eq!(launch.title, "orders staging · override");
+    assert!(
+        host.ran.borrow().is_empty(),
+        "a pinned Project still ran: {:?}",
+        host.ran.borrow(),
+    );
+}
+
+#[test]
+fn a_pinned_project_renders_no_stack() {
+    // The expensive half of the chain: a render is a `docker compose config` per Stack,
+    // against a budget of seconds. The Project holds one, and a pinned Project must not
+    // wait on it.
+    let world = ComposeHost::stack(INFRA, OVERRIDDEN_PORT);
+    let host = Overriding::at(OVERRIDES, pinning(PROJECT), &world);
+    assert!(
+        matches!(
+            planned_with(PROJECT, &Overrides::at(Some(Path::new(CONFIG))), &host),
+            Plan::Launch(_),
+        ),
+        "an Override naming this Project did not launch",
+    );
+    assert!(
+        world.rendered_in.borrow().is_empty(),
+        "a pinned Project rendered {:?}",
+        world.rendered_in.borrow(),
+    );
+}
+
+#[test]
+fn a_pinned_project_declaring_a_stopped_database_launches_anyway() {
+    // Unpinned, this Project declines with `DeclaredButNotRunning` — it declares a database
+    // and nothing is running it. Pinned, resolution succeeded, so there is nothing to
+    // diagnose: the Stack the user is not using is not their problem.
+    let world = ComposeHost::stack(INFRA, OVERRIDDEN_PORT);
+    assert!(
+        matches!(
+            planned_against(&world),
+            Plan::Decline(Diagnosis::DeclaredButNotRunning { .. }),
+        ),
+        "the double no longer declares a stopped database, so this test proves nothing",
+    );
+    let host = Overriding::at(OVERRIDES, pinning(PROJECT), &world);
+    let Plan::Launch(launch) =
+        planned_with(PROJECT, &Overrides::at(Some(Path::new(CONFIG))), &host)
+    else {
+        panic!("a pinned Project declined over a Stack it is not using");
+    };
+    assert_eq!(launch.argv.last().unwrap(), REMOTE);
+}
+
+#[test]
+fn an_override_file_naming_other_projects_says_nothing_about_this_one() {
+    // One machine-local file holds every Project the user has pinned, so most of what it
+    // says is about somewhere else. Reading it must leave this Project exactly where an
+    // absent file would: back on the chain, and declining as if nothing had been read.
+    let host = Overriding::at(OVERRIDES, pinning("/Users/b/AI/billing"), &SilentHost);
+    assert_eq!(
+        planned_with(PROJECT, &Overrides::at(Some(Path::new(CONFIG))), &host),
+        found_nothing(),
     );
 }
 
