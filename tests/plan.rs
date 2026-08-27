@@ -213,6 +213,9 @@ struct Container {
     /// The Compose label numbering this replica of the service, as the string Docker
     /// stores it as.
     number: Option<&'static str>,
+    /// Whatever else the container was labelled with. A container carries the labels its
+    /// image and its author put on it, and none of them are Compose's.
+    labels: Vec<(&'static str, &'static str)>,
     /// `NetworkSettings.Ports`, in Docker's own shape rather than a tidied one.
     ports: Value,
     env: Vec<&'static str>,
@@ -228,6 +231,7 @@ fn container() -> Container {
         working_dir: Some("/Users/b/AI/orders/infra"),
         service: None,
         number: None,
+        labels: Vec::new(),
         ports: published(&["5434"]),
         env: vec!["POSTGRES_USER=app", "POSTGRES_DB=orders", "PATH=/usr/bin"],
     }
@@ -257,6 +261,9 @@ impl Container {
         }
         if let Some(number) = self.number {
             labels["com.docker.compose.container-number"] = json!(number);
+        }
+        for (key, value) in &self.labels {
+            labels[*key] = json!(value);
         }
         json!([{
             "Name": self.name,
@@ -1372,6 +1379,7 @@ fn built(working_dir: &'static str, service: &'static str) -> Container {
         number: Some("1"),
         ports: published(&["5432"]),
         env: vec!["POSTGRES_USER=app", "POSTGRES_DB=warehouse"],
+        labels: Vec::new(),
     }
 }
 
@@ -1998,6 +2006,7 @@ fn shared(port: &str) -> Container {
         number: Some("1"),
         ports: published(&[port]),
         env: vec!["POSTGRES_USER=app", "POSTGRES_DB=appdb"],
+        labels: Vec::new(),
     }
 }
 
@@ -2539,6 +2548,139 @@ fn never_establishes_liveness_from_a_listening_port() {
             );
         }
     }
+}
+
+/// The same container, describing a database somewhere else as loudly as a container can:
+/// in its environment, where every other part of the DSN legitimately comes from, and in
+/// its labels. A `DATABASE_URL` naming a production host is what an application container's
+/// environment ordinarily holds, and the database container inherits the same `.env` file.
+fn describing_a_remote_host(base: Container) -> Container {
+    let mut env = base.env;
+    env.extend([
+        "POSTGRES_HOST=db.prod.example.com",
+        "PGHOST=10.0.0.7",
+        "DATABASE_URL=postgres://app:secret@db.prod.example.com:5432/orders",
+    ]);
+    Container {
+        env,
+        labels: vec![
+            ("com.example.database.host", "db.prod.example.com"),
+            ("com.example.database.address", "10.0.0.7"),
+        ],
+        ..base
+    }
+}
+
+#[test]
+fn no_strategy_resolves_a_candidate_away_from_the_loopback() {
+    // AC 22, down both Strategy paths, because they build their Candidates in the same
+    // place and a guard on one of them would let the other one through. A remote database
+    // is reached only by an Override the user wrote (ADR-0005): a shared host is not
+    // disposable, and a Strategy that inferred its address from a container's own
+    // description would connect the user to production because a `.env` file said so.
+    let docker = DockerHost::running(vec![describing_a_remote_host(container())]);
+    let compose = ComposeHost::stack(INFRA, MIXED_STACK)
+        .running(vec![describing_a_remote_host(built(INFRA, "warehouse"))]);
+
+    for (origin, host) in [("docker", &docker as &dyn Host), ("compose", &compose)] {
+        // Asserted rather than assumed: both doubles resolve, so a container that stopped
+        // matching one Strategy would silently be guarded twice by the other.
+        let launch = launched(host);
+        assert!(
+            launch.title.contains(origin),
+            "the {origin} Strategy did not produce this Launch: {}",
+            launch.title,
+        );
+        let dsn = launch.argv[1].clone();
+        assert!(
+            dsn.contains("@127.0.0.1:"),
+            "a Strategy resolved to {dsn}, which is not addressed at the loopback",
+        );
+        for elsewhere in ["db.prod.example.com", "10.0.0.7"] {
+            assert!(
+                !dsn.contains(elsewhere),
+                "a Strategy read {elsewhere} out of the container and put it in {dsn}",
+            );
+        }
+    }
+}
+
+/// The authority every Candidate DSN is addressed with, as `Candidate::dsn` writes it: the
+/// credentials, and then a name that is a constant rather than anything read from Docker.
+const AUTHORITY: &str = "://{credentials}@{HOST}:";
+
+#[test]
+fn no_source_but_the_one_assembles_a_dsn_at_all() {
+    // AC 22 in source, where the behavioural test cannot reach: it can only exercise the
+    // Strategies that exist, and the criterion is about the ones that do not yet. A DSN
+    // needs its scheme separator, so a second place that assembled one would show up here
+    // — and the one place that does assemble one may only address the constant.
+    let assembling: Vec<_> = sources()
+        .into_iter()
+        .filter(|(_, source)| {
+            source
+                .lines()
+                .any(|line| !line.trim_start().starts_with("//") && line.contains("://"))
+        })
+        .collect();
+
+    let [(path, source)] = &assembling[..] else {
+        panic!(
+            "{} source files assemble a DSN: {:?}. Exactly one may (AC 22) — the address is \
+             a constant there, and a Strategy that built its own would be free to address \
+             whatever a container told it to",
+            assembling.len(),
+            assembling.iter().map(|(path, _)| path).collect::<Vec<_>>(),
+        );
+    };
+    assert!(
+        source.contains(AUTHORITY),
+        "{} assembles a DSN whose authority is not `{AUTHORITY}`. Whatever stands where \
+         `{{HOST}}` did is what the user is connected to",
+        path.display(),
+    );
+    assert!(
+        source.contains("const HOST: &str = \"127.0.0.1\";"),
+        "{} no longer defines `HOST` as the loopback literal, so `{AUTHORITY}` proves \
+         nothing about where a Candidate points",
+        path.display(),
+    );
+}
+
+#[test]
+fn never_writes_a_file() {
+    // AC 23: the Override file is the user's, and a plugin that rewrote it — tidying its
+    // formatting, recording a connection it resolved — would edit a hand-written file
+    // holding credentials. `Host` offers no write at all, so the only route out is `std::fs`
+    // directly, which is what this scans for.
+    let mut reads = false;
+    for (path, source) in sources() {
+        reads |= source.contains("std::fs::read_to_string");
+        for write in [
+            "fs::write",
+            "File::create",
+            "OpenOptions",
+            "File::options",
+            "create_dir",
+            "remove_file",
+            "remove_dir",
+            "fs::rename",
+            "fs::copy",
+            "set_permissions",
+        ] {
+            assert!(
+                !source.contains(write),
+                "{} names `{write}`. The plugin reads the world and never writes to it \
+                 (AC 23)",
+                path.display(),
+            );
+        }
+    }
+    assert!(
+        reads,
+        "no source file reads a file either, so this scan is reading the wrong text and \
+         would pass however the plugin was rewritten",
+    );
 }
 
 #[test]
